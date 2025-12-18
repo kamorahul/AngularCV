@@ -1,0 +1,2202 @@
+# Task Decision Algorithm - Planning Document
+
+## Overview
+
+This document outlines the core decision algorithm for a task management service that uses OpenAI API to intelligently classify, relate, manage, estimate, and assign incoming tasks against existing tasks.
+
+---
+
+## 1. OpenAI API Analysis
+
+### 1.1 Relevant API Features
+
+#### Function Calling (Tool Use)
+- **Best fit for this use case**
+- Allows the model to call predefined functions to:
+  - Fetch existing tasks
+  - Fetch users by source for assignment
+  - Get subtasks for migration
+- Structured input/output ensures predictable behavior
+- Supports parallel function calls for efficiency
+
+```
+Flow:
+Input → OpenAI analyzes → Calls functions (tasks, users) → Makes decisions → Returns structured output
+```
+
+#### Structured Outputs (JSON Schema)
+- Guarantees output matches predefined schema
+- Essential for consistent downstream system updates
+- Use `response_format: { type: "json_schema", json_schema: {...} }`
+
+#### Key API Parameters to Consider
+| Parameter | Recommended Value | Reason |
+|-----------|------------------|--------|
+| `model` | `gpt-4o` or `gpt-4-turbo` | Better reasoning for complex decisions |
+| `temperature` | `0` or `0.1` | Deterministic decisions for consistency |
+| `tool_choice` | `auto` or `required` | Ensure function calling when needed |
+
+---
+
+## 2. Complete Task Attributes
+
+### 2.1 Task Object Schema
+
+```json
+{
+  "id": "UUID",
+  "title": "string (required)",
+  "description": "string (required)",
+  "status": "TODO | IN_PROGRESS | BLOCKED | IN_REVIEW | DONE | ARCHIVED",
+
+  "timing": {
+    "due_date": "ISO 8601 datetime | null",
+    "estimated_minutes": "integer | null",
+    "actual_minutes": "integer | null",
+    "created_at": "ISO 8601 datetime",
+    "updated_at": "ISO 8601 datetime",
+    "started_at": "ISO 8601 datetime | null",
+    "completed_at": "ISO 8601 datetime | null"
+  },
+
+  "assignment": {
+    "assignee_id": "string | null",
+    "assignee_name": "string | null",
+    "reporter_id": "string | null",
+    "reporter_name": "string | null",
+    "watchers": ["array of user IDs"]
+  },
+
+  "classification": {
+    "priority": "CRITICAL | HIGH | MEDIUM | LOW",
+    "type": "FEATURE | BUG | TASK | EPIC | STORY | SPIKE",
+    "labels": ["array of strings"],
+    "project_id": "string | null",
+    "sprint_id": "string | null"
+  },
+
+  "relationships": {
+    "parent_id": "string | null",
+    "subtask_ids": ["array of task IDs"],
+    "blocked_by": ["array of task IDs"],
+    "blocks": ["array of task IDs"],
+    "related_to": ["array of task IDs"]
+  },
+
+  "source": {
+    "source_id": "trello | teams | manual | other",
+    "source_priority": "1-10",
+    "external_id": "string | null",
+    "external_url": "string | null",
+    "raw_input": "string"
+  },
+
+  "metadata": {
+    "version": "integer",
+    "created_by_algorithm": "boolean",
+    "confidence_score": "0.0-1.0",
+    "requires_review": "boolean"
+  }
+}
+```
+
+### 2.2 Required vs Optional Attributes
+
+| Attribute | Required | AI Extracted | Notes |
+|-----------|----------|--------------|-------|
+| title | Yes | Yes | Extracted from raw input |
+| description | Yes | Yes | Extracted/summarized from input |
+| status | Yes | No | Defaults to TODO |
+| due_date | No | Yes | Extracted if mentioned in input |
+| estimated_minutes | No | Yes | AI estimates based on task complexity |
+| assignee_id | No | Yes | AI decides based on user list |
+| priority | Yes | Yes | AI determines from context + source |
+| type | Yes | Yes | AI classifies task type |
+
+---
+
+## 3. Input Structure
+
+```json
+{
+  "source_id": "trello | teams | manual | other",
+  "source_priority": 1-10,
+  "task_content": {
+    "raw_text": "string - the original input",
+    "title": "string - extracted or provided title (optional)",
+    "description": "string - extracted or provided description (optional)",
+    "mentioned_users": ["array of user names/emails mentioned (optional)"],
+    "mentioned_dates": ["array of date strings mentioned (optional)"],
+    "metadata": {}
+  },
+  "sender": {
+    "user_id": "string - who sent this message",
+    "name": "string",
+    "email": "string (optional)",
+    "role": "string (optional) - if known from source system",
+    "title": "string (optional) - job title if available",
+    "department": "string (optional)"
+  },
+  "context": {
+    "timestamp": "ISO 8601",
+    "project_id": "string (optional)",
+    "channel_id": "string (optional) - for Teams",
+    "channel_type": "executive | management | development | general (optional)",
+    "thread_id": "string (optional) - if part of a thread",
+    "reply_to_task_id": "string (optional) - if replying to task notification"
+  }
+}
+```
+
+### Priority Rules
+| Source | Default Priority | Notes |
+|--------|-----------------|-------|
+| Trello | 10 (highest) | Explicit task from task management system |
+| Teams | 5 | May be task or conversation |
+| Manual/Text | 3 | Requires classification first |
+| Other | 1 | Lowest confidence |
+
+---
+
+## 4. Input Classification (Task vs Non-Task)
+
+### 4.1 Classification Overview
+
+**Not every incoming message should become a task.** Before proceeding with the full algorithm, the system must first determine if the input is:
+- A valid, actionable task
+- Something that should be ignored
+
+### 4.2 Classification Categories
+
+```
+INPUT_CLASSIFICATION:
+
+VALID_TASK:
+  - Clear action or deliverable mentioned
+  - Actionable by a team member
+  - Has defined scope (even if broad)
+  - Proceed to full algorithm
+
+QUESTION_ONLY:
+  - Seeking information, not action
+  - No deliverable expected
+  - Examples: "What's the status of X?", "Do we have Y?"
+  - Action: IGNORE or RESPOND (not create task)
+
+CONVERSATION:
+  - General discussion or chat
+  - Social/casual messages
+  - Examples: "Thanks!", "Sounds good", "Let's discuss later"
+  - Action: IGNORE
+
+ACKNOWLEDGMENT:
+  - Confirming receipt or agreement
+  - No new action required
+  - Examples: "Got it", "Will do", "Noted"
+  - Action: IGNORE
+
+ALREADY_TRACKED:
+  - Refers to existing task without new info
+  - Status update without action change
+  - Examples: "Still working on X", "X is progressing"
+  - Action: IGNORE (or UPDATE_STATUS if explicit)
+
+INCOMPLETE:
+  - Too vague to act on
+  - Missing critical information
+  - Examples: "Fix it", "Look into that thing"
+  - Action: REQUEST_CLARIFICATION
+
+SPAM/NOISE:
+  - Automated messages, notifications
+  - System-generated content
+  - Action: IGNORE
+```
+
+### 4.3 Classification Algorithm
+
+```
+CLASSIFY_INPUT(raw_input, source):
+
+1. CHECK source priority:
+   - IF source == "trello":
+     - High confidence it's a task
+     - classification_bias = 0.8 toward VALID_TASK
+   - ELSE:
+     - No bias, evaluate content
+     - classification_bias = 0.0
+
+2. ANALYZE content signals:
+
+   TASK_INDICATORS (positive signals):
+   - Action verbs: "create", "fix", "implement", "update", "build", "review", "deploy"
+   - Deliverable nouns: "feature", "bug", "report", "document", "API", "page"
+   - Assignment language: "please", "need to", "should", "must", "can you"
+   - Deadline mentions: "by Friday", "ASAP", "before release"
+   - Explicit task markers: "TODO", "ACTION", "TASK:"
+
+   NON_TASK_INDICATORS (negative signals):
+   - Question-only: starts with "what", "why", "how", "is", "are", "did"
+   - Social phrases: "thanks", "great", "sounds good", "👍", "ok"
+   - Status without action: "still", "progressing", "ongoing"
+   - Past tense completion: "done", "finished", "completed"
+   - Conversational: "btw", "fyi", "just saying"
+
+3. CALCULATE task_probability:
+
+   task_signals = count(TASK_INDICATORS in raw_input)
+   non_task_signals = count(NON_TASK_INDICATORS in raw_input)
+
+   base_score = (task_signals - non_task_signals) / max(task_signals + non_task_signals, 1)
+   adjusted_score = (base_score + classification_bias) / 2
+
+   task_probability = normalize(adjusted_score, 0, 1)
+
+4. DETERMINE classification:
+
+   IF task_probability >= 0.7:
+       classification = VALID_TASK
+       action = PROCEED_TO_ALGORITHM
+
+   ELIF task_probability >= 0.4:
+       classification = UNCERTAIN
+       action = FLAG_FOR_REVIEW
+       # Could be task, human should verify
+
+   ELIF has_question_pattern(raw_input):
+       classification = QUESTION_ONLY
+       action = IGNORE_OR_RESPOND
+
+   ELIF length(raw_input) < 10 OR is_social_phrase(raw_input):
+       classification = CONVERSATION
+       action = IGNORE
+
+   ELSE:
+       classification = INCOMPLETE
+       action = REQUEST_CLARIFICATION
+
+5. RETURN:
+   {
+     "classification": "VALID_TASK | QUESTION_ONLY | CONVERSATION | ACKNOWLEDGMENT | INCOMPLETE | SPAM",
+     "task_probability": 0.0-1.0,
+     "action": "PROCEED_TO_ALGORITHM | IGNORE | REQUEST_CLARIFICATION | FLAG_FOR_REVIEW",
+     "confidence": 0.0-1.0,
+     "reasoning": "string explaining classification"
+   }
+```
+
+### 4.4 Source-Specific Rules
+
+| Source | Default Behavior | Notes |
+|--------|------------------|-------|
+| **Trello** | Assume VALID_TASK (0.9 probability) | Explicit task management system |
+| **Teams** | Evaluate content (0.5 base) | Mix of chat and tasks |
+| **Email** | Evaluate content (0.4 base) | Often conversational |
+| **Manual** | Evaluate content (0.6 base) | User explicitly submitting |
+| **Webhook** | Depends on webhook type | Configure per integration |
+
+### 4.5 Examples
+
+```
+EXAMPLE 1:
+Input: "We need to implement user authentication by next sprint"
+Source: teams
+Analysis:
+  - Task indicators: "need to", "implement", "by next sprint"
+  - No non-task indicators
+  - task_probability: 0.85
+Result: VALID_TASK → PROCEED_TO_ALGORITHM
+
+EXAMPLE 2:
+Input: "What's the status on the login bug?"
+Source: teams
+Analysis:
+  - Starts with "What's"
+  - Question pattern detected
+  - task_probability: 0.2
+Result: QUESTION_ONLY → IGNORE
+
+EXAMPLE 3:
+Input: "Fix it"
+Source: manual
+Analysis:
+  - Task indicator: "fix"
+  - But too vague, no context
+  - Length < threshold
+  - task_probability: 0.45
+Result: INCOMPLETE → REQUEST_CLARIFICATION
+
+EXAMPLE 4:
+Input: "API Integration - Add OAuth support for third-party login"
+Source: trello
+Analysis:
+  - Source is trello (high bias)
+  - Clear task indicators
+  - task_probability: 0.95
+Result: VALID_TASK → PROCEED_TO_ALGORITHM
+
+EXAMPLE 5:
+Input: "Thanks for the update! 👍"
+Source: teams
+Analysis:
+  - Social phrase: "Thanks"
+  - Emoji
+  - No task indicators
+  - task_probability: 0.1
+Result: CONVERSATION → IGNORE
+```
+
+### 4.6 Handling Uncertain Classifications
+
+When `action = FLAG_FOR_REVIEW`:
+
+```
+UNCERTAIN_HANDLING:
+
+1. Queue for human review
+2. Include in response:
+   - Original input
+   - Classification reasoning
+   - Suggested actions (proceed as task vs ignore)
+   - Option to force proceed or dismiss
+
+3. IF batch processing:
+   - Collect uncertain items
+   - Present for batch review
+   - Learn from reviewer decisions (future improvement)
+
+4. IF real-time:
+   - Return clarification request to source
+   - Example: "Is this a task you'd like me to track? Please confirm or provide more details."
+```
+
+### 4.7 Role-Based Priority Weighting
+
+The **role of the sender** significantly influences whether a message becomes a task. AI analyzes the sender's role and adjusts classification accordingly.
+
+#### 4.7.1 Role Analysis
+
+AI determines the sender's role by:
+1. Looking up user info from `get_users_by_source` response
+2. Analyzing email signature, title mentions
+3. Checking organizational hierarchy data if available
+4. Inferring from communication patterns
+
+```
+ANALYZE_SENDER_ROLE(sender_info, context):
+
+1. CHECK explicit role data:
+   - IF sender_info.role exists:
+     - RETURN sender_info.role
+
+2. CHECK title/signature:
+   - Parse for titles: "CEO", "CTO", "VP", "Director", "Manager", "Lead", "Engineer"
+   - Parse for indicators: "Founder", "Head of", "Senior", "Junior"
+
+3. INFER from context:
+   - Channel type (executive channel vs dev channel)
+   - Communication style (directive vs collaborative)
+   - Historical patterns
+
+4. RETURN:
+   {
+     "role_category": "EXECUTIVE | MANAGEMENT | LEAD | INDIVIDUAL_CONTRIBUTOR",
+     "role_title": "string - specific title if known",
+     "confidence": 0.0-1.0,
+     "inference_method": "explicit | parsed | inferred"
+   }
+```
+
+#### 4.7.2 Role Categories & Task Probability Multipliers
+
+| Role Category | Description | Task Probability Multiplier | Rationale |
+|---------------|-------------|----------------------------|-----------|
+| **EXECUTIVE** | C-level, VP, Directors, Stakeholders | **1.5x** | High authority, messages often directive |
+| **MANAGEMENT** | Project Managers, Product Managers, Team Leads | **1.3x** | Frequently creating/assigning tasks |
+| **LEAD** | Tech Leads, Senior Engineers, Architects | **1.1x** | May create tasks or discuss technically |
+| **INDIVIDUAL_CONTRIBUTOR** | Developers, Designers, QA | **0.7x** | Often discussing, not directing |
+
+#### 4.7.3 Role-Adjusted Classification Algorithm
+
+```
+CLASSIFY_WITH_ROLE(raw_input, source, sender_info):
+
+1. GET base classification:
+   base_result = CLASSIFY_INPUT(raw_input, source)
+
+2. ANALYZE sender role:
+   role_analysis = ANALYZE_SENDER_ROLE(sender_info, context)
+
+3. APPLY role multiplier:
+   role_multiplier = get_multiplier(role_analysis.role_category)
+   adjusted_probability = base_result.task_probability * role_multiplier
+   adjusted_probability = min(adjusted_probability, 1.0)  # Cap at 1.0
+
+4. RE-EVALUATE classification thresholds:
+
+   IF role_analysis.role_category == "EXECUTIVE":
+       # Executives: Lower threshold, almost always create task
+       task_threshold = 0.4  (instead of 0.7)
+       uncertain_threshold = 0.2  (instead of 0.4)
+
+   ELIF role_analysis.role_category == "MANAGEMENT":
+       # Managers: Slightly lower threshold
+       task_threshold = 0.5
+       uncertain_threshold = 0.3
+
+   ELIF role_analysis.role_category == "INDIVIDUAL_CONTRIBUTOR":
+       # Developers: Higher threshold required
+       task_threshold = 0.8
+       uncertain_threshold = 0.5
+
+   ELSE:
+       # Default thresholds
+       task_threshold = 0.7
+       uncertain_threshold = 0.4
+
+5. DETERMINE final classification with adjusted thresholds:
+
+   IF adjusted_probability >= task_threshold:
+       classification = VALID_TASK
+   ELIF adjusted_probability >= uncertain_threshold:
+       classification = UNCERTAIN
+   ELSE:
+       # For developers: check for alternative actions
+       IF role_analysis.role_category == "INDIVIDUAL_CONTRIBUTOR":
+           alt_action = CHECK_DEVELOPER_ALTERNATIVES(raw_input)
+           RETURN alt_action
+       ELSE:
+           # Standard non-task classification
+           classification = determine_non_task_type(raw_input)
+
+6. RETURN:
+   {
+     ...base_classification_fields,
+     "role_analysis": role_analysis,
+     "adjusted_probability": adjusted_probability,
+     "threshold_used": task_threshold
+   }
+```
+
+#### 4.7.4 Developer Conversation Handling
+
+When two developers are discussing (both sender and context indicate INDIVIDUAL_CONTRIBUTOR), apply special handling:
+
+```
+CHECK_DEVELOPER_ALTERNATIVES(raw_input, existing_tasks):
+
+# Developer messages that don't meet task threshold may still be actionable
+
+1. CHECK for task reference:
+   referenced_task = find_task_reference(raw_input, existing_tasks)
+
+   IF referenced_task exists:
+
+       # Check if it's additional context/description
+       IF contains_technical_details(raw_input) OR contains_requirements(raw_input):
+           RETURN {
+             "action": "UPDATE_DESCRIPTION",
+             "target_task_id": referenced_task.id,
+             "content_to_append": extract_relevant_content(raw_input),
+             "confidence": 0.7
+           }
+
+       # Check if it's a comment/discussion point
+       IF is_discussion_or_opinion(raw_input):
+           RETURN {
+             "action": "ADD_COMMENT",
+             "target_task_id": referenced_task.id,
+             "comment_content": raw_input,
+             "confidence": 0.8
+           }
+
+       # Check if it's breaking down work (subtask)
+       IF describes_subtask(raw_input):
+           RETURN {
+             "action": "CREATE_SUBTASK",
+             "parent_task_id": referenced_task.id,
+             "subtask_content": raw_input,
+             "confidence": 0.6
+           }
+
+2. CHECK for implicit task reference:
+   # Developer might be discussing a task without explicit reference
+   similar_tasks = find_similar_active_tasks(raw_input, existing_tasks)
+
+   IF similar_tasks.length == 1 AND similarity > 0.6:
+       # Likely discussing this task
+       RETURN check_action_type(raw_input, similar_tasks[0])
+
+   ELIF similar_tasks.length > 1:
+       # Ambiguous - could be related to multiple tasks
+       RETURN {
+         "action": "FLAG_FOR_REVIEW",
+         "possible_targets": similar_tasks,
+         "confidence": 0.4
+       }
+
+3. DEFAULT - not actionable:
+   RETURN {
+     "action": "IGNORE",
+     "classification": "DEVELOPER_DISCUSSION",
+     "reasoning": "Developer conversation without clear actionable outcome"
+   }
+```
+
+#### 4.7.5 Content Analysis for Developer Messages
+
+```
+CONTENT_ANALYSIS_HELPERS:
+
+contains_technical_details(text):
+  - Code snippets or file references
+  - Technical specifications
+  - Architecture decisions
+  - API contracts
+
+contains_requirements(text):
+  - "should", "must", "needs to"
+  - Acceptance criteria language
+  - User story patterns
+
+is_discussion_or_opinion(text):
+  - "I think", "maybe we should", "what if"
+  - Questions about approach
+  - Pros/cons discussion
+
+describes_subtask(text):
+  - Specific component of larger work
+  - "first we need to", "step 1"
+  - Granular technical work
+```
+
+#### 4.7.6 Role-Based Examples
+
+```
+EXAMPLE 1 - Executive Message:
+Input: "We should look into improving our checkout flow"
+Sender: CEO (EXECUTIVE)
+Source: teams
+Analysis:
+  - Base task_probability: 0.5 (vague, no clear action)
+  - Role multiplier: 1.5x
+  - Adjusted probability: 0.75
+  - Executive threshold: 0.4
+  - 0.75 >= 0.4 ✓
+Result: VALID_TASK → CREATE_NEW_TASK
+Priority: HIGH (executive initiated)
+
+EXAMPLE 2 - Project Manager Message:
+Input: "Can someone handle the payment gateway integration?"
+Sender: PM (MANAGEMENT)
+Source: teams
+Analysis:
+  - Base task_probability: 0.7 (action verb, clear deliverable)
+  - Role multiplier: 1.3x
+  - Adjusted probability: 0.91
+  - Management threshold: 0.5
+  - 0.91 >= 0.5 ✓
+Result: VALID_TASK → CREATE_NEW_TASK
+
+EXAMPLE 3 - Developer Discussion (Low Score):
+Input: "I was thinking the auth module might need some refactoring"
+Sender: Developer (INDIVIDUAL_CONTRIBUTOR)
+Source: teams (dev channel)
+Analysis:
+  - Base task_probability: 0.4 (tentative language)
+  - Role multiplier: 0.7x
+  - Adjusted probability: 0.28
+  - Developer threshold: 0.8
+  - 0.28 < 0.5 (uncertain threshold)
+  - Check developer alternatives...
+  - No clear task reference, discussion language
+Result: IGNORE (DEVELOPER_DISCUSSION)
+
+EXAMPLE 4 - Developer with Clear Task:
+Input: "We need to fix the null pointer exception in UserService.java line 45"
+Sender: Developer (INDIVIDUAL_CONTRIBUTOR)
+Source: teams
+Analysis:
+  - Base task_probability: 0.85 (clear action, specific)
+  - Role multiplier: 0.7x
+  - Adjusted probability: 0.595
+  - Developer threshold: 0.8
+  - 0.595 < 0.8, but check alternatives...
+  - Very specific technical issue → likely valid
+  - Override: Mark as task due to specificity
+Result: VALID_TASK (BUG type)
+
+EXAMPLE 5 - Developer Adding Context:
+Input: "For the login task, we also need to handle the case where session expires"
+Sender: Developer (INDIVIDUAL_CONTRIBUTOR)
+Source: teams
+Analysis:
+  - Base task_probability: 0.5
+  - Role multiplier: 0.7x
+  - Adjusted probability: 0.35
+  - Developer threshold: 0.8
+  - Check alternatives...
+  - References "login task" → find matching task
+  - Contains additional requirement
+Result: UPDATE_DESCRIPTION on referenced task
+OR: CREATE_SUBTASK for session handling
+
+EXAMPLE 6 - Developer Comment:
+Input: "I think we should use Redis for caching here instead of in-memory"
+Sender: Developer (INDIVIDUAL_CONTRIBUTOR)
+Source: teams (in thread about caching task)
+Analysis:
+  - Base task_probability: 0.3 (opinion, not directive)
+  - Role multiplier: 0.7x
+  - Adjusted probability: 0.21
+  - Context: Thread references caching task
+Result: ADD_COMMENT to caching task
+```
+
+#### 4.7.7 Role-Based Decision Matrix Summary
+
+| Sender Role | Task Score ≥ 0.8 | Task Score 0.5-0.8 | Task Score 0.3-0.5 | Task Score < 0.3 |
+|-------------|------------------|--------------------|--------------------|------------------|
+| **Executive** | CREATE_TASK (HIGH priority) | CREATE_TASK | CREATE_TASK or FLAG_REVIEW | FLAG_REVIEW |
+| **Management** | CREATE_TASK | CREATE_TASK | FLAG_REVIEW | IGNORE |
+| **Lead** | CREATE_TASK | CREATE_TASK or FLAG | FLAG_REVIEW or ALT_ACTION | ALT_ACTION or IGNORE |
+| **Developer** | CREATE_TASK | CHECK_ALT_ACTIONS | CHECK_ALT_ACTIONS | IGNORE or COMMENT |
+
+**ALT_ACTIONS** = UPDATE_DESCRIPTION, ADD_COMMENT, CREATE_SUBTASK
+
+---
+
+## 5. Core Decision Algorithm
+
+### 5.1 Algorithm Flow (Updated)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         INPUT RECEIVED                          │
+│              (source_id, priority, task_content)                │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│               STEP 0: INPUT CLASSIFICATION                      │
+│         Is this a valid task or should it be ignored?           │
+│         (See Section 4)                                         │
+│                                                                 │
+│         IF classification != VALID_TASK:                        │
+│             → RETURN early (IGNORE/CLARIFY/REVIEW)              │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼ (only if VALID_TASK)
+┌─────────────────────────────────────────────────────────────────┐
+│                    STEP 1: TASK EXTRACTION                      │
+│         OpenAI extracts task intent from raw input              │
+│         Extracts: title, description, mentioned dates/users     │
+│         Output: normalized_task object                          │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              STEP 2: PARALLEL FUNCTION CALLS                    │
+│    ┌──────────────────────┐    ┌──────────────────────┐        │
+│    │  get_existing_tasks  │    │  get_users_by_source │        │
+│    │  (keywords, filters) │    │  (source_id)         │        │
+│    └──────────────────────┘    └──────────────────────┘        │
+│         Returns: existing       Returns: available users        │
+│         task objects            with ID, name, workload         │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                STEP 3: RELATIONSHIP ANALYSIS                    │
+│         For each existing task, calculate:                      │
+│         - Semantic similarity score (0-1)                       │
+│         - Scope comparison (broader/narrower/equal)             │
+│         - Priority comparison                                   │
+│         - Due date conflict analysis                            │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   STEP 4: DECISION MATRIX                       │
+│              (Parent/Subtask/New Task Decision)                 │
+│                    (See Section 4.2)                            │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                STEP 5: TIME ESTIMATION                          │
+│         AI estimates task duration in minutes                   │
+│         Based on: task complexity, similar tasks, scope         │
+│                    (See Section 5)                              │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                 STEP 6: DUE DATE ANALYSIS                       │
+│         Determine/validate due date                             │
+│         Check conflicts with related tasks                      │
+│                    (See Section 6)                              │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                STEP 7: USER ASSIGNMENT                          │
+│         Select best assignee from user list                     │
+│         Based on: skills, workload, mentions                    │
+│                    (See Section 7)                              │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                  STEP 8: OUTPUT GENERATION                      │
+│         Generate action object with all attributes              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 Decision Matrix (Task Relationship)
+
+The algorithm uses these factors to make relationship decisions:
+
+| Factor | Weight | Description |
+|--------|--------|-------------|
+| **Semantic Similarity** | 35% | How closely related is the incoming task to existing tasks |
+| **Scope Comparison** | 30% | Is incoming task broader, narrower, or equal in scope |
+| **Priority Delta** | 20% | Priority difference between incoming and existing |
+| **Due Date Alignment** | 15% | How due dates relate to each other |
+
+#### Decision Rules
+
+```
+RULE 1: NO RELATIONSHIP (similarity < 0.3)
+├── Action: CREATE_NEW_TASK
+└── No impact on existing tasks
+
+RULE 2: SUBTASK CANDIDATE (similarity >= 0.3 AND scope = NARROWER)
+├── Check: incoming_priority <= existing_priority
+│   ├── TRUE:  Action: CREATE_AS_SUBTASK
+│   │          └── Inherit parent's due_date if not specified
+│   └── FALSE: Action: CREATE_NEW_TASK (flag for review)
+└── Link to parent task
+
+RULE 3: PARENT CANDIDATE (similarity >= 0.3 AND scope = BROADER)
+├── Check: incoming_priority >= existing_priority
+│   ├── TRUE:  Action: CREATE_AS_PARENT_AND_RETIRE
+│   │          └── Trigger: SUBTASK_MIGRATION
+│   │          └── Aggregate estimated_minutes from children
+│   └── FALSE: Action: CREATE_NEW_TASK (flag for review)
+└── Retire existing task(s)
+
+RULE 4: DUPLICATE/CONFLICT (similarity >= 0.8 AND scope = EQUAL)
+├── Check: incoming_priority > existing_priority
+│   ├── TRUE:  Action: REPLACE_EXISTING
+│   │          └── Preserve existing timing data if available
+│   └── FALSE: Action: SKIP_OR_MERGE
+└── Handle based on priority
+
+RULE 5: PARTIAL OVERLAP (0.3 <= similarity < 0.8 AND scope = EQUAL)
+├── Action: CREATE_NEW_TASK
+├── Flag: POTENTIAL_CONFLICT (for human review)
+└── Check: due_date conflicts → flag if overlapping
+```
+
+### 5.3 Scope Comparison Logic
+
+```
+SCOPE DETERMINATION:
+
+Input: incoming_task, existing_task
+
+1. Extract key entities/objectives from both tasks
+2. Compare coverage:
+
+   IF incoming covers ALL of existing + MORE:
+       scope = BROADER
+
+   ELSE IF existing covers ALL of incoming + MORE:
+       scope = NARROWER
+
+   ELSE IF significant overlap but neither fully contains other:
+       scope = EQUAL
+
+   ELSE:
+       scope = UNRELATED
+```
+
+### 5.4 Subtask Migration Logic
+
+When an incoming task becomes a PARENT and retires existing task(s):
+
+```
+SUBTASK MIGRATION ALGORITHM:
+
+1. Get all subtasks of retired task(s)
+2. For each subtask:
+   a. Calculate relevance to new parent (similarity score)
+   b. IF relevance >= 0.5:
+      - Migrate subtask to new parent
+      - Update subtask's parent_id
+      - Preserve original estimated_minutes
+   c. ELSE:
+      - Flag for manual review
+      - Optionally: create as independent task
+3. Aggregate timing:
+   - Sum estimated_minutes from all migrated subtasks
+   - Earliest due_date becomes reference
+4. Mark retired task as ARCHIVED (not deleted)
+5. Create audit trail of migration
+```
+
+---
+
+## 5. Time Estimation Algorithm
+
+### 5.1 Estimation Factors
+
+| Factor | Weight | Description |
+|--------|--------|-------------|
+| **Task Complexity** | 40% | Based on description analysis |
+| **Similar Task History** | 30% | Average time of similar completed tasks |
+| **Scope/Size** | 20% | Number of deliverables mentioned |
+| **Type Baseline** | 10% | Default estimates by task type |
+
+### 5.2 Complexity Classification
+
+```
+COMPLEXITY LEVELS:
+
+TRIVIAL (15-30 minutes):
+- Single, clear action
+- No dependencies mentioned
+- Keywords: "quick", "simple", "just", "minor"
+
+LOW (30-120 minutes):
+- 1-2 clear steps
+- Minimal research needed
+- Keywords: "update", "change", "fix typo"
+
+MEDIUM (2-8 hours = 120-480 minutes):
+- Multiple steps involved
+- Some research/investigation needed
+- Keywords: "implement", "create", "build", "investigate"
+
+HIGH (1-3 days = 480-1440 minutes):
+- Complex multi-step work
+- Dependencies on other work
+- Keywords: "design", "architect", "refactor", "major"
+
+VERY_HIGH (3+ days = 1440+ minutes):
+- Large feature/epic scope
+- Multiple team members likely
+- Keywords: "epic", "initiative", "overhaul", "migration"
+```
+
+### 5.3 Estimation Algorithm
+
+```
+ESTIMATE_MINUTES(task):
+
+1. Determine complexity_level from description
+2. Get base_estimate from complexity range midpoint
+3. IF similar_tasks exist:
+   - Get average actual_minutes from completed similar tasks
+   - adjusted_estimate = (base_estimate * 0.4) + (similar_avg * 0.6)
+4. ELSE:
+   - adjusted_estimate = base_estimate
+5. Apply type modifier:
+   - BUG: * 1.2 (bugs often have hidden complexity)
+   - SPIKE: * 0.8 (timeboxed by nature)
+   - FEATURE: * 1.0 (baseline)
+6. Round to nearest 15 minutes
+7. Return estimated_minutes
+
+OUTPUT: {
+  "estimated_minutes": integer,
+  "complexity": "TRIVIAL|LOW|MEDIUM|HIGH|VERY_HIGH",
+  "confidence": 0.0-1.0,
+  "reasoning": "string"
+}
+```
+
+### 5.4 Estimation for Parent Tasks
+
+```
+PARENT TASK ESTIMATION:
+
+IF task has subtasks:
+   - Sum all subtask estimated_minutes
+   - Add 10-20% buffer for coordination overhead
+   - parent_estimated = sum(subtask_estimates) * 1.15
+
+IF creating new parent from retired task:
+   - Preserve retired task's actual_minutes if any
+   - Re-estimate remaining work
+   - Total = completed_work + remaining_estimate
+```
+
+---
+
+## 6. Due Date Analysis Algorithm
+
+### 6.1 Due Date Extraction
+
+```
+EXTRACT_DUE_DATE(raw_input):
+
+1. Look for explicit date patterns:
+   - "due by [date]", "deadline: [date]", "by [date]"
+   - ISO dates, natural language dates
+
+2. Look for relative dates:
+   - "tomorrow", "next week", "end of sprint"
+   - "ASAP", "urgent" → set to 24-48 hours
+
+3. Look for contextual dates:
+   - "before the release" → lookup release date
+   - "Q1", "this quarter" → end of period
+
+4. IF no date found AND task is subtask:
+   - Inherit parent's due_date
+
+5. IF no date found AND standalone:
+   - Leave as null (to be set by assignee)
+
+OUTPUT: {
+  "due_date": "ISO 8601 | null",
+  "due_date_source": "explicit | relative | inherited | inferred | none",
+  "confidence": 0.0-1.0
+}
+```
+
+### 6.2 Due Date Conflict Analysis
+
+```
+CHECK_DUE_DATE_CONFLICTS(task, related_tasks):
+
+conflicts = []
+
+FOR each related_task:
+
+  IF task.due_date < related_task.due_date AND task blocks related_task:
+      # Good - blocker is due before dependent
+      CONTINUE
+
+  IF task.due_date > related_task.due_date AND task blocks related_task:
+      # Bad - blocker due after dependent
+      conflicts.append({
+        "type": "BLOCKER_AFTER_DEPENDENT",
+        "task_id": related_task.id,
+        "severity": "HIGH"
+      })
+
+  IF task is subtask AND task.due_date > parent.due_date:
+      # Bad - subtask due after parent
+      conflicts.append({
+        "type": "SUBTASK_AFTER_PARENT",
+        "task_id": parent.id,
+        "severity": "MEDIUM",
+        "suggestion": "Adjust subtask due date to " + parent.due_date
+      })
+
+  IF task.estimated_minutes > minutes_until(task.due_date):
+      # Warning - not enough time
+      conflicts.append({
+        "type": "INSUFFICIENT_TIME",
+        "severity": "HIGH",
+        "estimated_minutes": task.estimated_minutes,
+        "available_minutes": minutes_until(task.due_date)
+      })
+
+RETURN conflicts
+```
+
+### 6.3 Due Date Adjustment Logic
+
+```
+ADJUST_DUE_DATE(task, conflicts):
+
+FOR each conflict:
+
+  IF conflict.type == "SUBTASK_AFTER_PARENT":
+      task.due_date = parent.due_date - buffer(1 day)
+      task.flags.due_date_adjusted = true
+
+  IF conflict.type == "INSUFFICIENT_TIME":
+      IF task.due_date is flexible:
+          new_date = now() + task.estimated_minutes + buffer
+          task.due_date = new_date
+          task.flags.due_date_adjusted = true
+      ELSE:
+          task.flags.requires_review = true
+          task.flags.review_reason = "Insufficient time for deadline"
+
+RETURN task
+```
+
+---
+
+## 7. User Assignment Algorithm
+
+### 7.1 User Data Structure (from get_users_by_source)
+
+```json
+{
+  "users": [
+    {
+      "id": "string",
+      "name": "string",
+      "email": "string",
+      "role": "developer | designer | qa | manager | etc",
+      "skills": ["array of skill tags"],
+      "current_workload": {
+        "assigned_tasks": "integer",
+        "total_estimated_minutes": "integer",
+        "capacity_percentage": "0-100"
+      },
+      "availability": {
+        "is_available": "boolean",
+        "out_until": "ISO 8601 | null",
+        "working_hours": "object"
+      }
+    }
+  ]
+}
+```
+
+### 7.2 Assignment Algorithm
+
+```
+ASSIGN_USER(task, users):
+
+1. FILTER available users:
+   - Remove users where is_available = false
+   - Remove users where out_until > task.due_date
+
+2. CHECK for explicit mentions:
+   - IF task mentions user by name/email:
+     - mentioned_user = find_user_by_mention(task.raw_input, users)
+     - IF mentioned_user is available:
+       - RETURN mentioned_user (confidence: 0.9)
+
+3. SCORE remaining users:
+
+   FOR each user:
+     score = 0
+
+     # Skill match (40%)
+     skill_match = count_matching_skills(user.skills, task.labels)
+     score += (skill_match / total_required_skills) * 40
+
+     # Workload balance (35%)
+     workload_score = (100 - user.capacity_percentage) / 100
+     score += workload_score * 35
+
+     # Role fit (15%)
+     IF user.role matches task.type:
+       score += 15
+
+     # Past performance on similar tasks (10%)
+     IF user has completed similar tasks:
+       avg_performance = get_performance_score(user, similar_tasks)
+       score += avg_performance * 10
+
+     user.assignment_score = score
+
+4. SELECT best user:
+   - Sort users by assignment_score DESC
+   - IF top_score > 50:
+     - RETURN top_user (confidence: top_score/100)
+   - ELSE:
+     - RETURN null (flag for manual assignment)
+
+OUTPUT: {
+  "assignee_id": "string | null",
+  "assignee_name": "string | null",
+  "assignment_confidence": 0.0-1.0,
+  "assignment_reasoning": "string",
+  "alternative_assignees": [top 3 alternatives with scores]
+}
+```
+
+### 7.3 Assignment Rules
+
+```
+SPECIAL ASSIGNMENT RULES:
+
+1. SUBTASK INHERITANCE:
+   - IF subtask AND parent has assignee:
+     - Default to parent's assignee
+     - Unless subtask requires different skill
+
+2. BUG PRIORITY:
+   - IF task.type == BUG AND priority == CRITICAL:
+     - Prefer users with lowest current workload
+     - Override skill matching weight to 20%
+     - Increase workload weight to 55%
+
+3. REASSIGNMENT ON PARENT CREATION:
+   - IF creating parent from retired task:
+     - Keep retired task's assignee for parent
+     - Notify assignee of scope change
+
+4. ROUND-ROBIN FALLBACK:
+   - IF no clear winner (all scores < 30):
+     - Use round-robin among available users
+     - Track last_assigned_to for fairness
+```
+
+---
+
+## 8. Output Structure
+
+### 8.1 Complete Decision Output Schema
+
+```json
+{
+  "classification": {
+    "type": "VALID_TASK | QUESTION_ONLY | CONVERSATION | ACKNOWLEDGMENT | INCOMPLETE | SPAM | DEVELOPER_DISCUSSION",
+    "task_probability": 0.0-1.0,
+    "adjusted_probability": 0.0-1.0,
+    "action_taken": "PROCEED_TO_ALGORITHM | IGNORE | REQUEST_CLARIFICATION | FLAG_FOR_REVIEW | ALT_ACTION",
+    "reasoning": "string - why this classification"
+  },
+
+  "role_analysis": {
+    "role_category": "EXECUTIVE | MANAGEMENT | LEAD | INDIVIDUAL_CONTRIBUTOR | UNKNOWN",
+    "role_title": "string | null",
+    "confidence": 0.0-1.0,
+    "inference_method": "explicit | parsed | inferred",
+    "multiplier_applied": 0.7-1.5,
+    "threshold_used": 0.4-0.8
+  },
+
+  "decision": {
+    "action": "CREATE_NEW_TASK | CREATE_AS_SUBTASK | CREATE_AS_PARENT_AND_RETIRE | REPLACE_EXISTING | SKIP_OR_MERGE | IGNORED | NEEDS_CLARIFICATION | UPDATE_DESCRIPTION | ADD_COMMENT",
+    "confidence": 0.0-1.0,
+    "reasoning": "string - explanation of decision"
+  },
+
+  "task": {
+    "id": "generated UUID",
+    "title": "string",
+    "description": "string",
+    "status": "TODO",
+
+    "timing": {
+      "due_date": "ISO 8601 | null",
+      "due_date_source": "explicit | relative | inherited | inferred | none",
+      "estimated_minutes": "integer",
+      "complexity": "TRIVIAL | LOW | MEDIUM | HIGH | VERY_HIGH"
+    },
+
+    "assignment": {
+      "assignee_id": "string | null",
+      "assignee_name": "string | null",
+      "assignment_confidence": 0.0-1.0,
+      "assignment_reasoning": "string",
+      "alternative_assignees": []
+    },
+
+    "classification": {
+      "priority": "CRITICAL | HIGH | MEDIUM | LOW",
+      "type": "FEATURE | BUG | TASK | EPIC | STORY | SPIKE",
+      "labels": []
+    },
+
+    "source": {
+      "id": "original source_id",
+      "priority": "number",
+      "raw_input": "original input"
+    }
+  },
+
+  "relationships": {
+    "parent_id": "string | null",
+    "is_parent_of": ["array of task IDs being retired"],
+    "migrated_subtasks": ["array of subtask IDs"],
+    "conflicts_with": ["array of task IDs with potential conflicts"]
+  },
+
+  "due_date_analysis": {
+    "conflicts": [],
+    "adjustments_made": [],
+    "warnings": []
+  },
+
+  "flags": {
+    "requires_review": true/false,
+    "review_reasons": ["array of reasons"],
+    "potential_duplicates": ["array of task IDs"],
+    "due_date_adjusted": true/false,
+    "assignment_uncertain": true/false
+  },
+
+  "actions": [
+    {
+      "type": "CREATE | UPDATE | ARCHIVE | LINK | UNLINK | ASSIGN | NOTIFY",
+      "target_id": "task ID",
+      "payload": {}
+    }
+  ],
+
+  "audit": {
+    "timestamp": "ISO 8601",
+    "algorithm_version": "2.0",
+    "model_used": "gpt-4o",
+    "processing_time_ms": "number",
+    "functions_called": ["list of function names"]
+  }
+}
+```
+
+### 8.2 Action Types
+
+| Action Type | Description | Required Payload |
+|-------------|-------------|------------------|
+| `CREATE` | Create new task | full task object |
+| `UPDATE` | Update existing task | task_id, fields to update |
+| `UPDATE_DESCRIPTION` | Append to task description | task_id, content_to_append |
+| `ADD_COMMENT` | Add comment to task | task_id, comment_content, author_id |
+| `ARCHIVE` | Retire/archive task | task_id, reason |
+| `LINK` | Create parent-child relationship | parent_id, child_id |
+| `UNLINK` | Remove relationship | parent_id, child_id |
+| `ASSIGN` | Assign user to task | task_id, user_id |
+| `NOTIFY` | Send notification | user_ids, message, type |
+| `IGNORE` | No action taken | reasoning |
+
+### 8.3 Developer Alternative Action Payloads
+
+```json
+{
+  "action": "UPDATE_DESCRIPTION",
+  "target_task_id": "UUID of existing task",
+  "content_to_append": "string - the new content to add",
+  "append_location": "end | section",
+  "section_name": "string | null (if appending to specific section)",
+  "source_message": {
+    "sender_id": "string",
+    "timestamp": "ISO 8601",
+    "raw_content": "original message"
+  }
+}
+
+{
+  "action": "ADD_COMMENT",
+  "target_task_id": "UUID of existing task",
+  "comment": {
+    "content": "string",
+    "author_id": "string",
+    "author_name": "string",
+    "timestamp": "ISO 8601",
+    "type": "DISCUSSION | TECHNICAL | QUESTION | UPDATE"
+  }
+}
+
+{
+  "action": "CREATE_SUBTASK",
+  "parent_task_id": "UUID of parent task",
+  "subtask": {
+    "title": "string",
+    "description": "string",
+    "estimated_minutes": "integer | null",
+    "inherit_assignee": "boolean",
+    "inherit_due_date": "boolean"
+  }
+}
+```
+
+---
+
+## 9. OpenAI/ChatGPT Integration - Complete Specification
+
+This section defines exactly what OpenAI/ChatGPT is responsible for, what tools it will use, and what we expect from it.
+
+### 9.1 OpenAI's Role & Responsibilities
+
+OpenAI acts as the **decision-making brain** of the system. It is responsible for:
+
+| Responsibility | Description | Output |
+|----------------|-------------|--------|
+| **Input Classification** | Determine if input is a task or should be ignored | Classification type + confidence |
+| **Role Analysis** | Analyze sender's role and apply weight | Role category + multiplier |
+| **Task Extraction** | Extract title, description, dates, users from raw text | Normalized task object |
+| **Relationship Analysis** | Compare incoming task to existing tasks | Parent/subtask/new decision |
+| **Time Estimation** | Estimate task complexity and duration | Minutes + complexity level |
+| **Due Date Analysis** | Extract/validate due dates, detect conflicts | Due date + conflicts |
+| **User Assignment** | Select best assignee from available users | Assignee + reasoning |
+| **Action Generation** | Produce list of actions for downstream system | Actions array |
+
+### 9.2 What OpenAI Does NOT Do
+
+| Not Responsible For | Handled By |
+|---------------------|------------|
+| Storing tasks | Your database |
+| Fetching existing tasks | Your API (via function call) |
+| Fetching users | Your API (via function call) |
+| Sending notifications | Your notification service |
+| Syncing with Trello/Jira | Your integration layer |
+| Authentication | Your auth layer |
+
+### 9.3 Model Configuration
+
+```json
+{
+  "model": "gpt-4o",
+  "temperature": 0,
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "TaskDecisionOutput",
+      "strict": true,
+      "schema": { ... }
+    }
+  },
+  "tool_choice": "auto"
+}
+```
+
+| Parameter | Value | Reason |
+|-----------|-------|--------|
+| `model` | `gpt-4o` | Best reasoning, function calling support |
+| `temperature` | `0` | Deterministic - same input = same output |
+| `response_format` | `json_schema` | Guarantees valid JSON matching our schema |
+| `tool_choice` | `auto` | Let model decide when to call functions |
+
+---
+
+### 9.4 Complete Tool Definitions
+
+#### 9.4.1 get_existing_tasks
+
+**Purpose**: Fetch existing tasks to compare against incoming task for relationship analysis.
+
+**When AI Calls This**: Always (for every valid task classification)
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "get_existing_tasks",
+    "description": "Search for existing tasks that may be related to the incoming task. Use this to find potential parent tasks, duplicates, or conflicts. Call this early to understand the task landscape.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "keywords": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Key terms from the incoming task to search for. Extract main nouns, verbs, and technical terms."
+        },
+        "project_id": {
+          "type": "string",
+          "description": "Filter to specific project if context provides one"
+        },
+        "status_filter": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["TODO", "IN_PROGRESS", "BLOCKED", "IN_REVIEW"]
+          },
+          "description": "Only return tasks in these statuses. Default: active tasks only."
+        },
+        "assignee_id": {
+          "type": "string",
+          "description": "Filter by assignee if looking for a specific person's tasks"
+        },
+        "include_subtasks": {
+          "type": "boolean",
+          "description": "Whether to include subtasks in results. Default: true"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Max tasks to return. Default: 20"
+        }
+      },
+      "required": ["keywords"]
+    }
+  }
+}
+```
+
+**Your System Returns**:
+```json
+{
+  "tasks": [
+    {
+      "id": "uuid",
+      "title": "string",
+      "description": "string",
+      "status": "TODO | IN_PROGRESS | ...",
+      "priority": "CRITICAL | HIGH | MEDIUM | LOW",
+      "type": "FEATURE | BUG | TASK | ...",
+      "parent_id": "uuid | null",
+      "subtask_ids": ["uuid"],
+      "assignee_id": "uuid | null",
+      "assignee_name": "string | null",
+      "due_date": "ISO 8601 | null",
+      "estimated_minutes": "integer | null",
+      "labels": ["string"],
+      "created_at": "ISO 8601",
+      "source": {
+        "id": "trello | teams | ...",
+        "external_id": "string | null"
+      }
+    }
+  ],
+  "total_count": "integer"
+}
+```
+
+---
+
+#### 9.4.2 get_users_by_source
+
+**Purpose**: Fetch available users for assignment decisions.
+
+**When AI Calls This**: When classification = VALID_TASK (parallel with get_existing_tasks)
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "get_users_by_source",
+    "description": "Fetch team members available for task assignment. Returns users with their roles, skills, and current workload. Use this to determine the best assignee.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "description": "The source system (trello, teams, etc.) to get users from"
+        },
+        "include_workload": {
+          "type": "boolean",
+          "description": "Include current task count and capacity. Default: true"
+        },
+        "skills_filter": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Only return users with these skills"
+        },
+        "available_only": {
+          "type": "boolean",
+          "description": "Exclude users who are OOO or at capacity. Default: true"
+        },
+        "department_filter": {
+          "type": "string",
+          "description": "Filter by department if task requires specific team"
+        }
+      },
+      "required": ["source_id"]
+    }
+  }
+}
+```
+
+**Your System Returns**:
+```json
+{
+  "users": [
+    {
+      "id": "uuid",
+      "name": "string",
+      "email": "string",
+      "role_category": "EXECUTIVE | MANAGEMENT | LEAD | INDIVIDUAL_CONTRIBUTOR",
+      "role_title": "string",
+      "department": "string",
+      "skills": ["string"],
+      "workload": {
+        "current_task_count": "integer",
+        "total_estimated_minutes": "integer",
+        "capacity_percentage": "0-100"
+      },
+      "availability": {
+        "is_available": "boolean",
+        "out_until": "ISO 8601 | null"
+      }
+    }
+  ]
+}
+```
+
+---
+
+#### 9.4.3 get_task_subtasks
+
+**Purpose**: Fetch subtasks when considering task retirement/migration.
+
+**When AI Calls This**: Only when decision = CREATE_AS_PARENT_AND_RETIRE
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "get_task_subtasks",
+    "description": "Fetch all subtasks of a task. Use this when you need to migrate subtasks to a new parent task.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "The parent task ID to get subtasks for"
+        },
+        "include_completed": {
+          "type": "boolean",
+          "description": "Include completed subtasks. Default: false"
+        }
+      },
+      "required": ["task_id"]
+    }
+  }
+}
+```
+
+**Your System Returns**:
+```json
+{
+  "subtasks": [
+    {
+      "id": "uuid",
+      "title": "string",
+      "status": "TODO | IN_PROGRESS | DONE | ...",
+      "assignee_id": "uuid | null",
+      "estimated_minutes": "integer | null",
+      "due_date": "ISO 8601 | null"
+    }
+  ]
+}
+```
+
+---
+
+#### 9.4.4 get_similar_completed_tasks
+
+**Purpose**: Get historical data for time estimation.
+
+**When AI Calls This**: Optionally, when estimating complex tasks
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "get_similar_completed_tasks",
+    "description": "Fetch similar completed tasks to reference their actual time spent. Use this to improve time estimation accuracy.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "keywords": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Keywords describing the task type"
+        },
+        "task_type": {
+          "type": "string",
+          "enum": ["FEATURE", "BUG", "TASK", "SPIKE"],
+          "description": "Type of task to find similar ones"
+        },
+        "complexity": {
+          "type": "string",
+          "enum": ["TRIVIAL", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"],
+          "description": "Approximate complexity level"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Max tasks to return. Default: 5"
+        }
+      },
+      "required": ["keywords"]
+    }
+  }
+}
+```
+
+**Your System Returns**:
+```json
+{
+  "tasks": [
+    {
+      "id": "uuid",
+      "title": "string",
+      "type": "FEATURE | BUG | ...",
+      "complexity": "MEDIUM | HIGH | ...",
+      "estimated_minutes": "integer",
+      "actual_minutes": "integer",
+      "accuracy_ratio": "float (actual/estimated)"
+    }
+  ],
+  "average_actual_minutes": "integer",
+  "average_accuracy_ratio": "float"
+}
+```
+
+---
+
+### 9.5 Complete System Prompt
+
+This is the full system prompt to send to OpenAI:
+
+```
+You are the Task Decision Engine for a project management system. Your job is to analyze incoming messages and make intelligent decisions about task creation, relationships, and assignments.
+
+## YOUR CAPABILITIES
+
+You have access to these functions:
+1. `get_existing_tasks` - Search for related tasks in the system
+2. `get_users_by_source` - Get available team members for assignment
+3. `get_task_subtasks` - Get subtasks of a specific task (for migration)
+4. `get_similar_completed_tasks` - Get historical data for time estimation
+
+## INPUT FORMAT
+
+You will receive a JSON object with:
+- `source_id`: Where this came from (trello, teams, manual, etc.)
+- `source_priority`: 1-10, where Trello=10 (highest)
+- `task_content.raw_text`: The original message/input
+- `sender`: Who sent it (with role, title if available)
+- `context`: Channel info, thread info, timestamps
+
+## YOUR DECISION PROCESS
+
+### Step 0: Classification
+First, determine if this is even a task:
+
+TASK INDICATORS (positive):
+- Action verbs: create, fix, implement, update, build, review, deploy
+- Deliverable nouns: feature, bug, report, document, API
+- Assignment language: please, need to, should, must, can you
+- Deadline mentions: by Friday, ASAP, before release
+
+NON-TASK INDICATORS (negative):
+- Questions only: what, why, how, is, are
+- Social: thanks, great, sounds good, 👍
+- Status without action: still, progressing, ongoing
+- Conversational: btw, fyi, just saying
+
+### Step 1: Role-Based Weighting
+Apply sender role multiplier:
+- EXECUTIVE (CEO, VP, Director): 1.5x multiplier, threshold 0.4
+- MANAGEMENT (PM, Product Manager): 1.3x multiplier, threshold 0.5
+- LEAD (Tech Lead, Senior): 1.1x multiplier, threshold 0.7
+- INDIVIDUAL_CONTRIBUTOR (Developer): 0.7x multiplier, threshold 0.8
+
+### Step 2: Fetch Context
+If classified as VALID_TASK, call these in parallel:
+- `get_existing_tasks` with keywords from input
+- `get_users_by_source` with source_id
+
+### Step 3: Relationship Analysis
+For each existing task, determine:
+- Semantic similarity (0.0-1.0)
+- Scope: BROADER (incoming contains existing), NARROWER (existing contains incoming), EQUAL, UNRELATED
+
+Decision rules:
+- similarity < 0.3 → CREATE_NEW_TASK
+- similarity >= 0.3 AND scope = NARROWER → CREATE_AS_SUBTASK
+- similarity >= 0.3 AND scope = BROADER → CREATE_AS_PARENT_AND_RETIRE (migrate subtasks)
+- similarity >= 0.8 AND scope = EQUAL → REPLACE_EXISTING or SKIP_OR_MERGE
+- 0.3 <= similarity < 0.8 AND scope = EQUAL → CREATE_NEW_TASK with conflict flag
+
+### Step 4: Time Estimation
+Estimate complexity and duration:
+
+TRIVIAL: 15-30 min (single action, "quick", "simple")
+LOW: 30-120 min (1-2 steps, "update", "fix typo")
+MEDIUM: 120-480 min (multiple steps, "implement", "create")
+HIGH: 480-1440 min (complex, dependencies, "design", "refactor")
+VERY_HIGH: 1440+ min (epic scope, "initiative", "migration")
+
+Apply type modifiers: BUG × 1.2, SPIKE × 0.8
+
+### Step 5: Due Date
+Extract from text or inherit from parent. Flag conflicts:
+- Subtask due after parent
+- Blocker due after dependent
+- Insufficient time before deadline
+
+### Step 6: User Assignment
+Score users by:
+- Skill match: 40%
+- Workload availability: 35%
+- Role fit: 15%
+- Past performance: 10%
+
+If user mentioned in text, prioritize them (confidence 0.9).
+
+### Step 7: Developer Alternatives
+If sender is INDIVIDUAL_CONTRIBUTOR and doesn't meet task threshold:
+- Check if adding context → UPDATE_DESCRIPTION
+- Check if opinion/discussion → ADD_COMMENT
+- Check if breaking down work → CREATE_SUBTASK
+- Otherwise → IGNORE
+
+## OUTPUT REQUIREMENTS
+
+Always return valid JSON matching the DecisionOutput schema:
+- Be deterministic (same input = same output)
+- Provide confidence scores for all decisions
+- Set requires_review = true when confidence < 0.7
+- Include clear reasoning for decisions
+- List all actions to take
+
+## PRIORITY RULES
+
+1. Trello source always has highest authority
+2. Higher role = higher task probability
+3. When in doubt, flag for human review
+4. Never create duplicate tasks
+```
+
+---
+
+### 9.6 Conversation Flow Examples
+
+#### Example 1: Executive Creates Task
+
+**Message 1 - Your System to OpenAI:**
+```json
+{
+  "role": "user",
+  "content": {
+    "source_id": "teams",
+    "source_priority": 5,
+    "task_content": {
+      "raw_text": "We need to improve our checkout conversion rate. Look into what's causing drop-offs.",
+      "metadata": {}
+    },
+    "sender": {
+      "user_id": "user-123",
+      "name": "Sarah Chen",
+      "role": "VP of Product",
+      "title": "VP of Product"
+    },
+    "context": {
+      "timestamp": "2024-01-15T10:30:00Z",
+      "channel_type": "executive"
+    }
+  }
+}
+```
+
+**Message 2 - OpenAI Response (Tool Calls):**
+```json
+{
+  "role": "assistant",
+  "tool_calls": [
+    {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+        "name": "get_existing_tasks",
+        "arguments": "{\"keywords\": [\"checkout\", \"conversion\", \"drop-off\"], \"status_filter\": [\"TODO\", \"IN_PROGRESS\"]}"
+      }
+    },
+    {
+      "id": "call_2",
+      "type": "function",
+      "function": {
+        "name": "get_users_by_source",
+        "arguments": "{\"source_id\": \"teams\", \"include_workload\": true}"
+      }
+    }
+  ]
+}
+```
+
+**Message 3 - Your System (Tool Results):**
+```json
+{
+  "role": "tool",
+  "tool_call_id": "call_1",
+  "content": "{\"tasks\": [], \"total_count\": 0}"
+}
+```
+```json
+{
+  "role": "tool",
+  "tool_call_id": "call_2",
+  "content": "{\"users\": [{\"id\": \"u1\", \"name\": \"Alex Dev\", \"role_category\": \"INDIVIDUAL_CONTRIBUTOR\", \"skills\": [\"frontend\", \"analytics\"], \"workload\": {\"capacity_percentage\": 60}}]}"
+}
+```
+
+**Message 4 - OpenAI Final Response:**
+```json
+{
+  "classification": {
+    "type": "VALID_TASK",
+    "task_probability": 0.65,
+    "adjusted_probability": 0.975,
+    "action_taken": "PROCEED_TO_ALGORITHM",
+    "reasoning": "VP of Product requesting investigation. Role multiplier 1.5x applied. Executive threshold 0.4 exceeded."
+  },
+  "role_analysis": {
+    "role_category": "EXECUTIVE",
+    "role_title": "VP of Product",
+    "confidence": 1.0,
+    "inference_method": "explicit",
+    "multiplier_applied": 1.5,
+    "threshold_used": 0.4
+  },
+  "decision": {
+    "action": "CREATE_NEW_TASK",
+    "confidence": 0.95,
+    "reasoning": "No related tasks found. Executive directive to investigate checkout issues."
+  },
+  "task": {
+    "title": "Investigate checkout conversion drop-offs",
+    "description": "Analyze checkout funnel to identify causes of conversion drop-offs and recommend improvements.",
+    "timing": {
+      "due_date": null,
+      "estimated_minutes": 480,
+      "complexity": "HIGH"
+    },
+    "assignment": {
+      "assignee_id": "u1",
+      "assignee_name": "Alex Dev",
+      "assignment_confidence": 0.75,
+      "assignment_reasoning": "Has frontend and analytics skills, 60% capacity available"
+    },
+    "classification": {
+      "priority": "HIGH",
+      "type": "SPIKE",
+      "labels": ["checkout", "conversion", "analytics"]
+    }
+  },
+  "actions": [
+    {
+      "type": "CREATE",
+      "payload": { ... }
+    },
+    {
+      "type": "NOTIFY",
+      "target_id": "u1",
+      "payload": {
+        "message": "You've been assigned: Investigate checkout conversion drop-offs",
+        "type": "ASSIGNMENT"
+      }
+    }
+  ]
+}
+```
+
+---
+
+#### Example 2: Developer Discussion (Ignored)
+
+**Input:**
+```json
+{
+  "source_id": "teams",
+  "task_content": {
+    "raw_text": "I was thinking the auth module might need some refactoring"
+  },
+  "sender": {
+    "role_category": "INDIVIDUAL_CONTRIBUTOR",
+    "title": "Software Engineer"
+  }
+}
+```
+
+**Output (No Tool Calls Needed):**
+```json
+{
+  "classification": {
+    "type": "DEVELOPER_DISCUSSION",
+    "task_probability": 0.4,
+    "adjusted_probability": 0.28,
+    "action_taken": "IGNORE",
+    "reasoning": "Tentative language ('was thinking', 'might'). Developer threshold 0.8 not met. No clear actionable item."
+  },
+  "decision": {
+    "action": "IGNORED",
+    "confidence": 0.85,
+    "reasoning": "Developer conversation without clear task intent"
+  },
+  "actions": []
+}
+```
+
+---
+
+#### Example 3: Developer Adding Context to Existing Task
+
+**Input:**
+```json
+{
+  "source_id": "teams",
+  "task_content": {
+    "raw_text": "For the login task, we also need to handle the case where session expires during checkout"
+  },
+  "sender": {
+    "role_category": "INDIVIDUAL_CONTRIBUTOR"
+  },
+  "context": {
+    "thread_id": "thread-456"
+  }
+}
+```
+
+**After get_existing_tasks returns a matching "Login feature" task:**
+
+**Output:**
+```json
+{
+  "classification": {
+    "type": "VALID_TASK",
+    "task_probability": 0.5,
+    "adjusted_probability": 0.35,
+    "action_taken": "ALT_ACTION",
+    "reasoning": "References existing task. Contains additional requirement."
+  },
+  "decision": {
+    "action": "UPDATE_DESCRIPTION",
+    "confidence": 0.8,
+    "reasoning": "Developer adding edge case to existing login task"
+  },
+  "actions": [
+    {
+      "type": "UPDATE_DESCRIPTION",
+      "target_task_id": "task-789",
+      "content_to_append": "\n\n**Additional Requirement:**\nHandle session expiry during checkout flow.",
+      "source_message": {
+        "sender_id": "dev-123",
+        "timestamp": "2024-01-15T14:00:00Z"
+      }
+    }
+  ]
+}
+```
+
+---
+
+### 9.7 Response Schema (Structured Output)
+
+Use OpenAI's structured output feature to guarantee valid responses:
+
+```json
+{
+  "name": "TaskDecisionOutput",
+  "strict": true,
+  "schema": {
+    "type": "object",
+    "required": ["classification", "decision", "actions"],
+    "additionalProperties": false,
+    "properties": {
+      "classification": {
+        "type": "object",
+        "required": ["type", "task_probability", "action_taken", "reasoning"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["VALID_TASK", "QUESTION_ONLY", "CONVERSATION", "ACKNOWLEDGMENT", "INCOMPLETE", "SPAM", "DEVELOPER_DISCUSSION"]
+          },
+          "task_probability": {"type": "number", "minimum": 0, "maximum": 1},
+          "adjusted_probability": {"type": "number", "minimum": 0, "maximum": 1},
+          "action_taken": {
+            "type": "string",
+            "enum": ["PROCEED_TO_ALGORITHM", "IGNORE", "REQUEST_CLARIFICATION", "FLAG_FOR_REVIEW", "ALT_ACTION"]
+          },
+          "reasoning": {"type": "string"}
+        }
+      },
+      "role_analysis": {
+        "type": "object",
+        "properties": {
+          "role_category": {
+            "type": "string",
+            "enum": ["EXECUTIVE", "MANAGEMENT", "LEAD", "INDIVIDUAL_CONTRIBUTOR", "UNKNOWN"]
+          },
+          "role_title": {"type": ["string", "null"]},
+          "confidence": {"type": "number"},
+          "inference_method": {
+            "type": "string",
+            "enum": ["explicit", "parsed", "inferred"]
+          },
+          "multiplier_applied": {"type": "number"},
+          "threshold_used": {"type": "number"}
+        }
+      },
+      "decision": {
+        "type": "object",
+        "required": ["action", "confidence", "reasoning"],
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["CREATE_NEW_TASK", "CREATE_AS_SUBTASK", "CREATE_AS_PARENT_AND_RETIRE", "REPLACE_EXISTING", "SKIP_OR_MERGE", "IGNORED", "NEEDS_CLARIFICATION", "UPDATE_DESCRIPTION", "ADD_COMMENT", "CREATE_SUBTASK"]
+          },
+          "confidence": {"type": "number"},
+          "reasoning": {"type": "string"}
+        }
+      },
+      "task": {
+        "type": ["object", "null"],
+        "properties": {
+          "title": {"type": "string"},
+          "description": {"type": "string"},
+          "timing": {
+            "type": "object",
+            "properties": {
+              "due_date": {"type": ["string", "null"]},
+              "due_date_source": {"type": "string"},
+              "estimated_minutes": {"type": "integer"},
+              "complexity": {"type": "string"}
+            }
+          },
+          "assignment": {
+            "type": "object",
+            "properties": {
+              "assignee_id": {"type": ["string", "null"]},
+              "assignee_name": {"type": ["string", "null"]},
+              "assignment_confidence": {"type": "number"},
+              "assignment_reasoning": {"type": "string"}
+            }
+          },
+          "classification": {
+            "type": "object",
+            "properties": {
+              "priority": {"type": "string"},
+              "type": {"type": "string"},
+              "labels": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        }
+      },
+      "relationships": {
+        "type": "object",
+        "properties": {
+          "parent_id": {"type": ["string", "null"]},
+          "is_parent_of": {"type": "array", "items": {"type": "string"}},
+          "migrated_subtasks": {"type": "array", "items": {"type": "string"}},
+          "conflicts_with": {"type": "array", "items": {"type": "string"}}
+        }
+      },
+      "flags": {
+        "type": "object",
+        "properties": {
+          "requires_review": {"type": "boolean"},
+          "review_reasons": {"type": "array", "items": {"type": "string"}},
+          "due_date_adjusted": {"type": "boolean"},
+          "assignment_uncertain": {"type": "boolean"}
+        }
+      },
+      "actions": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["CREATE", "UPDATE", "UPDATE_DESCRIPTION", "ADD_COMMENT", "ARCHIVE", "LINK", "UNLINK", "ASSIGN", "NOTIFY", "IGNORE"]
+            },
+            "target_task_id": {"type": "string"},
+            "payload": {"type": "object"}
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+---
+
+### 9.8 Implementation Checklist
+
+Your system needs to implement:
+
+| Component | Description | Notes |
+|-----------|-------------|-------|
+| **OpenAI Client** | Wrapper to call OpenAI API | Handle retries, rate limits |
+| **Function Handlers** | Endpoints for each function | Return data in expected format |
+| **Message Builder** | Construct messages with input | Follow input schema |
+| **Response Parser** | Parse structured output | Validate against schema |
+| **Action Executor** | Execute actions array | Route to appropriate services |
+| **Audit Logger** | Log full request/response | For debugging and learning |
+
+---
+
+### 9.9 Cost Optimization Tips
+
+| Strategy | Implementation |
+|----------|----------------|
+| **Cache decisions** | Hash input, cache output for identical messages |
+| **Skip obvious non-tasks** | Pre-filter emojis, "thanks", etc. before calling OpenAI |
+| **Batch similar requests** | Group messages from same thread |
+| **Use smaller model for classification** | GPT-3.5 for step 0, GPT-4 for full analysis |
+| **Limit function results** | Return max 20 tasks, 50 users |
+
+---
+
+## 10. Edge Cases & Handling
+
+### 10.1 Classification Edge Cases
+
+| Edge Case | Handling Strategy |
+|-----------|-------------------|
+| Empty input | Return SPAM classification, IGNORE |
+| Single word input | Check if action verb → INCOMPLETE, else IGNORE |
+| Only emojis | Return CONVERSATION, IGNORE |
+| Mixed signals (task + question) | Higher weight to task signals if action verb present |
+| Foreign language input | Attempt translation first, then classify |
+| Code snippet only | Check context - could be task (fix this) or just sharing |
+| URL only | Check URL type - Trello link = task reference, else IGNORE |
+| Forwarded message | Analyze forwarded content, not "FW:" prefix |
+
+### 10.2 Role-Based Edge Cases
+
+| Edge Case | Handling Strategy |
+|-----------|-------------------|
+| Unknown sender role | Default to LEAD (middle tier), flag for review |
+| External stakeholder | Treat as EXECUTIVE if from client/partner domain |
+| Bot/automated sender | IGNORE unless explicitly configured webhook |
+| Multiple senders (group message) | Use highest role among participants |
+| Sender role changed recently | Use current role, not historical |
+| Contractor/vendor | Treat as INDIVIDUAL_CONTRIBUTOR unless specified |
+| Executive in dev channel | Still apply EXECUTIVE multiplier |
+| Developer in executive channel | Apply INDIVIDUAL_CONTRIBUTOR but flag for review |
+| New employee (no history) | Default based on title, lower confidence |
+| Conflicting role signals | Explicit role > parsed title > inferred |
+
+### 10.3 Developer Alternative Action Edge Cases
+
+| Edge Case | Handling Strategy |
+|-----------|-------------------|
+| Comment references multiple tasks | Flag for review, list possible targets |
+| Description update too long | Suggest creating subtask instead |
+| Comment is actually a blocker | Detect blocker keywords, create BLOCKED status update |
+| Developer "assigns" to another | Detect assignment language, suggest ASSIGN action |
+| Thread has multiple topics | Split into separate evaluations |
+| Reply to archived task | Reopen task or create new linked task |
+
+### 10.4 Algorithm Edge Cases
+
+| Edge Case | Handling Strategy |
+|-----------|-------------------|
+| No existing tasks found | CREATE_NEW_TASK with confidence: 1.0 |
+| Multiple potential parents | Select highest priority, flag for review |
+| Circular relationship detected | Reject, flag for manual resolution |
+| Function call timeout | Retry once, then flag for async processing |
+| Confidence below threshold | Always require human review |
+| No available users | Flag for manual assignment, suggest wait |
+| Past due date mentioned | Flag warning, suggest realistic date |
+| Conflicting user mentions | List all mentioned, require clarification |
+| Estimation too uncertain | Provide range instead of single value |
+| Task references non-existent parent | Create as standalone, flag for review |
+
+---
+
+## 11. Algorithm Versioning
+
+Maintain version in output for traceability:
+- **v1.0**: Initial decision matrix with 3-factor weighting
+- **v2.0**: Added time estimation, due date analysis, user assignment
+
+---
+
+## 12. Next Steps
+
+- [ ] Review and refine decision matrix thresholds
+- [ ] Define exact database schema for tasks
+- [ ] Implement function handlers
+- [ ] Build test cases for each decision path
+- [ ] Create monitoring for decision quality
+- [ ] Define user skill taxonomy
+- [ ] Set up workload calculation service
+- [ ] Create feedback loop for estimation accuracy
