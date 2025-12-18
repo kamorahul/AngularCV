@@ -1306,193 +1306,821 @@ SPECIAL ASSIGNMENT RULES:
 
 ---
 
-## 9. OpenAI Function Definitions
+## 9. OpenAI/ChatGPT Integration - Complete Specification
 
-### 9.1 Complete Function Set
+This section defines exactly what OpenAI/ChatGPT is responsible for, what tools it will use, and what we expect from it.
+
+### 9.1 OpenAI's Role & Responsibilities
+
+OpenAI acts as the **decision-making brain** of the system. It is responsible for:
+
+| Responsibility | Description | Output |
+|----------------|-------------|--------|
+| **Input Classification** | Determine if input is a task or should be ignored | Classification type + confidence |
+| **Role Analysis** | Analyze sender's role and apply weight | Role category + multiplier |
+| **Task Extraction** | Extract title, description, dates, users from raw text | Normalized task object |
+| **Relationship Analysis** | Compare incoming task to existing tasks | Parent/subtask/new decision |
+| **Time Estimation** | Estimate task complexity and duration | Minutes + complexity level |
+| **Due Date Analysis** | Extract/validate due dates, detect conflicts | Due date + conflicts |
+| **User Assignment** | Select best assignee from available users | Assignee + reasoning |
+| **Action Generation** | Produce list of actions for downstream system | Actions array |
+
+### 9.2 What OpenAI Does NOT Do
+
+| Not Responsible For | Handled By |
+|---------------------|------------|
+| Storing tasks | Your database |
+| Fetching existing tasks | Your API (via function call) |
+| Fetching users | Your API (via function call) |
+| Sending notifications | Your notification service |
+| Syncing with Trello/Jira | Your integration layer |
+| Authentication | Your auth layer |
+
+### 9.3 Model Configuration
 
 ```json
 {
-  "tools": [
-    {
-      "type": "function",
-      "function": {
-        "name": "get_existing_tasks",
-        "description": "Fetch existing tasks from the system to compare against incoming task",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "keywords": {
-              "type": "array",
-              "items": {"type": "string"},
-              "description": "Keywords to search for related tasks"
-            },
-            "project_id": {
-              "type": "string",
-              "description": "Optional project filter"
-            },
-            "status_filter": {
-              "type": "array",
-              "items": {"type": "string"},
-              "description": "Task statuses to include (active, pending, etc.)"
-            },
-            "assignee_id": {
-              "type": "string",
-              "description": "Filter by assignee"
-            },
-            "due_date_range": {
-              "type": "object",
-              "properties": {
-                "from": {"type": "string"},
-                "to": {"type": "string"}
-              }
-            },
-            "limit": {
-              "type": "integer",
-              "description": "Maximum number of tasks to return"
-            }
+  "model": "gpt-4o",
+  "temperature": 0,
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "TaskDecisionOutput",
+      "strict": true,
+      "schema": { ... }
+    }
+  },
+  "tool_choice": "auto"
+}
+```
+
+| Parameter | Value | Reason |
+|-----------|-------|--------|
+| `model` | `gpt-4o` | Best reasoning, function calling support |
+| `temperature` | `0` | Deterministic - same input = same output |
+| `response_format` | `json_schema` | Guarantees valid JSON matching our schema |
+| `tool_choice` | `auto` | Let model decide when to call functions |
+
+---
+
+### 9.4 Complete Tool Definitions
+
+#### 9.4.1 get_existing_tasks
+
+**Purpose**: Fetch existing tasks to compare against incoming task for relationship analysis.
+
+**When AI Calls This**: Always (for every valid task classification)
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "get_existing_tasks",
+    "description": "Search for existing tasks that may be related to the incoming task. Use this to find potential parent tasks, duplicates, or conflicts. Call this early to understand the task landscape.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "keywords": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Key terms from the incoming task to search for. Extract main nouns, verbs, and technical terms."
+        },
+        "project_id": {
+          "type": "string",
+          "description": "Filter to specific project if context provides one"
+        },
+        "status_filter": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["TODO", "IN_PROGRESS", "BLOCKED", "IN_REVIEW"]
           },
-          "required": ["keywords"]
+          "description": "Only return tasks in these statuses. Default: active tasks only."
+        },
+        "assignee_id": {
+          "type": "string",
+          "description": "Filter by assignee if looking for a specific person's tasks"
+        },
+        "include_subtasks": {
+          "type": "boolean",
+          "description": "Whether to include subtasks in results. Default: true"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Max tasks to return. Default: 20"
         }
+      },
+      "required": ["keywords"]
+    }
+  }
+}
+```
+
+**Your System Returns**:
+```json
+{
+  "tasks": [
+    {
+      "id": "uuid",
+      "title": "string",
+      "description": "string",
+      "status": "TODO | IN_PROGRESS | ...",
+      "priority": "CRITICAL | HIGH | MEDIUM | LOW",
+      "type": "FEATURE | BUG | TASK | ...",
+      "parent_id": "uuid | null",
+      "subtask_ids": ["uuid"],
+      "assignee_id": "uuid | null",
+      "assignee_name": "string | null",
+      "due_date": "ISO 8601 | null",
+      "estimated_minutes": "integer | null",
+      "labels": ["string"],
+      "created_at": "ISO 8601",
+      "source": {
+        "id": "trello | teams | ...",
+        "external_id": "string | null"
       }
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "get_users_by_source",
-        "description": "Fetch available users for task assignment based on the source system",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "source_id": {
-              "type": "string",
-              "description": "The source system (trello, teams, etc.)"
-            },
-            "include_workload": {
-              "type": "boolean",
-              "description": "Include current workload data"
-            },
-            "skills_filter": {
-              "type": "array",
-              "items": {"type": "string"},
-              "description": "Filter users by required skills"
-            },
-            "available_only": {
-              "type": "boolean",
-              "description": "Only return currently available users"
-            }
-          },
-          "required": ["source_id"]
+    }
+  ],
+  "total_count": "integer"
+}
+```
+
+---
+
+#### 9.4.2 get_users_by_source
+
+**Purpose**: Fetch available users for assignment decisions.
+
+**When AI Calls This**: When classification = VALID_TASK (parallel with get_existing_tasks)
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "get_users_by_source",
+    "description": "Fetch team members available for task assignment. Returns users with their roles, skills, and current workload. Use this to determine the best assignee.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "description": "The source system (trello, teams, etc.) to get users from"
+        },
+        "include_workload": {
+          "type": "boolean",
+          "description": "Include current task count and capacity. Default: true"
+        },
+        "skills_filter": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Only return users with these skills"
+        },
+        "available_only": {
+          "type": "boolean",
+          "description": "Exclude users who are OOO or at capacity. Default: true"
+        },
+        "department_filter": {
+          "type": "string",
+          "description": "Filter by department if task requires specific team"
         }
-      }
-    },
+      },
+      "required": ["source_id"]
+    }
+  }
+}
+```
+
+**Your System Returns**:
+```json
+{
+  "users": [
     {
-      "type": "function",
-      "function": {
-        "name": "get_task_subtasks",
-        "description": "Fetch subtasks of a specific task for migration analysis",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "task_id": {
-              "type": "string",
-              "description": "The parent task ID"
-            },
-            "include_completed": {
-              "type": "boolean",
-              "description": "Include completed subtasks"
-            }
-          },
-          "required": ["task_id"]
-        }
-      }
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "get_similar_completed_tasks",
-        "description": "Fetch similar completed tasks for time estimation reference",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "keywords": {
-              "type": "array",
-              "items": {"type": "string"},
-              "description": "Keywords describing the task"
-            },
-            "task_type": {
-              "type": "string",
-              "description": "Type of task (FEATURE, BUG, etc.)"
-            },
-            "limit": {
-              "type": "integer",
-              "description": "Maximum number of tasks to return"
-            }
-          },
-          "required": ["keywords"]
-        }
+      "id": "uuid",
+      "name": "string",
+      "email": "string",
+      "role_category": "EXECUTIVE | MANAGEMENT | LEAD | INDIVIDUAL_CONTRIBUTOR",
+      "role_title": "string",
+      "department": "string",
+      "skills": ["string"],
+      "workload": {
+        "current_task_count": "integer",
+        "total_estimated_minutes": "integer",
+        "capacity_percentage": "0-100"
+      },
+      "availability": {
+        "is_available": "boolean",
+        "out_until": "ISO 8601 | null"
       }
     }
   ]
 }
 ```
 
-### 9.2 System Prompt Template
+---
+
+#### 9.4.3 get_task_subtasks
+
+**Purpose**: Fetch subtasks when considering task retirement/migration.
+
+**When AI Calls This**: Only when decision = CREATE_AS_PARENT_AND_RETIRE
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "get_task_subtasks",
+    "description": "Fetch all subtasks of a task. Use this when you need to migrate subtasks to a new parent task.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "The parent task ID to get subtasks for"
+        },
+        "include_completed": {
+          "type": "boolean",
+          "description": "Include completed subtasks. Default: false"
+        }
+      },
+      "required": ["task_id"]
+    }
+  }
+}
+```
+
+**Your System Returns**:
+```json
+{
+  "subtasks": [
+    {
+      "id": "uuid",
+      "title": "string",
+      "status": "TODO | IN_PROGRESS | DONE | ...",
+      "assignee_id": "uuid | null",
+      "estimated_minutes": "integer | null",
+      "due_date": "ISO 8601 | null"
+    }
+  ]
+}
+```
+
+---
+
+#### 9.4.4 get_similar_completed_tasks
+
+**Purpose**: Get historical data for time estimation.
+
+**When AI Calls This**: Optionally, when estimating complex tasks
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "get_similar_completed_tasks",
+    "description": "Fetch similar completed tasks to reference their actual time spent. Use this to improve time estimation accuracy.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "keywords": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Keywords describing the task type"
+        },
+        "task_type": {
+          "type": "string",
+          "enum": ["FEATURE", "BUG", "TASK", "SPIKE"],
+          "description": "Type of task to find similar ones"
+        },
+        "complexity": {
+          "type": "string",
+          "enum": ["TRIVIAL", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"],
+          "description": "Approximate complexity level"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Max tasks to return. Default: 5"
+        }
+      },
+      "required": ["keywords"]
+    }
+  }
+}
+```
+
+**Your System Returns**:
+```json
+{
+  "tasks": [
+    {
+      "id": "uuid",
+      "title": "string",
+      "type": "FEATURE | BUG | ...",
+      "complexity": "MEDIUM | HIGH | ...",
+      "estimated_minutes": "integer",
+      "actual_minutes": "integer",
+      "accuracy_ratio": "float (actual/estimated)"
+    }
+  ],
+  "average_actual_minutes": "integer",
+  "average_accuracy_ratio": "float"
+}
+```
+
+---
+
+### 9.5 Complete System Prompt
+
+This is the full system prompt to send to OpenAI:
 
 ```
-You are a Task Decision Engine. Your role is to analyze incoming tasks and:
-1. Determine their relationship to existing tasks
-2. Estimate time required
-3. Analyze and set due dates
-4. Assign to the most appropriate user
+You are the Task Decision Engine for a project management system. Your job is to analyze incoming messages and make intelligent decisions about task creation, relationships, and assignments.
 
-## Your Responsibilities:
+## YOUR CAPABILITIES
 
-### Step 1: Task Extraction
-Extract from the raw input:
-- Title (concise, action-oriented)
-- Description (detailed requirements)
-- Any mentioned dates or deadlines
-- Any mentioned users
-- Task type and priority indicators
+You have access to these functions:
+1. `get_existing_tasks` - Search for related tasks in the system
+2. `get_users_by_source` - Get available team members for assignment
+3. `get_task_subtasks` - Get subtasks of a specific task (for migration)
+4. `get_similar_completed_tasks` - Get historical data for time estimation
 
-### Step 2: Fetch Context (Parallel Calls)
-- Call get_existing_tasks to find related tasks
-- Call get_users_by_source to get available assignees
+## INPUT FORMAT
+
+You will receive a JSON object with:
+- `source_id`: Where this came from (trello, teams, manual, etc.)
+- `source_priority`: 1-10, where Trello=10 (highest)
+- `task_content.raw_text`: The original message/input
+- `sender`: Who sent it (with role, title if available)
+- `context`: Channel info, thread info, timestamps
+
+## YOUR DECISION PROCESS
+
+### Step 0: Classification
+First, determine if this is even a task:
+
+TASK INDICATORS (positive):
+- Action verbs: create, fix, implement, update, build, review, deploy
+- Deliverable nouns: feature, bug, report, document, API
+- Assignment language: please, need to, should, must, can you
+- Deadline mentions: by Friday, ASAP, before release
+
+NON-TASK INDICATORS (negative):
+- Questions only: what, why, how, is, are
+- Social: thanks, great, sounds good, 👍
+- Status without action: still, progressing, ongoing
+- Conversational: btw, fyi, just saying
+
+### Step 1: Role-Based Weighting
+Apply sender role multiplier:
+- EXECUTIVE (CEO, VP, Director): 1.5x multiplier, threshold 0.4
+- MANAGEMENT (PM, Product Manager): 1.3x multiplier, threshold 0.5
+- LEAD (Tech Lead, Senior): 1.1x multiplier, threshold 0.7
+- INDIVIDUAL_CONTRIBUTOR (Developer): 0.7x multiplier, threshold 0.8
+
+### Step 2: Fetch Context
+If classified as VALID_TASK, call these in parallel:
+- `get_existing_tasks` with keywords from input
+- `get_users_by_source` with source_id
 
 ### Step 3: Relationship Analysis
 For each existing task, determine:
-- Semantic similarity (0-1)
-- Scope comparison (BROADER/NARROWER/EQUAL)
-- Priority comparison
-- Due date alignment
+- Semantic similarity (0.0-1.0)
+- Scope: BROADER (incoming contains existing), NARROWER (existing contains incoming), EQUAL, UNRELATED
+
+Decision rules:
+- similarity < 0.3 → CREATE_NEW_TASK
+- similarity >= 0.3 AND scope = NARROWER → CREATE_AS_SUBTASK
+- similarity >= 0.3 AND scope = BROADER → CREATE_AS_PARENT_AND_RETIRE (migrate subtasks)
+- similarity >= 0.8 AND scope = EQUAL → REPLACE_EXISTING or SKIP_OR_MERGE
+- 0.3 <= similarity < 0.8 AND scope = EQUAL → CREATE_NEW_TASK with conflict flag
 
 ### Step 4: Time Estimation
-- Analyze task complexity
-- Optionally call get_similar_completed_tasks for reference
-- Estimate in minutes, round to nearest 15
+Estimate complexity and duration:
 
-### Step 5: Due Date Analysis
-- Extract or infer due date
-- Check for conflicts with related tasks
-- Suggest adjustments if needed
+TRIVIAL: 15-30 min (single action, "quick", "simple")
+LOW: 30-120 min (1-2 steps, "update", "fix typo")
+MEDIUM: 120-480 min (multiple steps, "implement", "create")
+HIGH: 480-1440 min (complex, dependencies, "design", "refactor")
+VERY_HIGH: 1440+ min (epic scope, "initiative", "migration")
+
+Apply type modifiers: BUG × 1.2, SPIKE × 0.8
+
+### Step 5: Due Date
+Extract from text or inherit from parent. Flag conflicts:
+- Subtask due after parent
+- Blocker due after dependent
+- Insufficient time before deadline
 
 ### Step 6: User Assignment
-- Score users based on skills, workload, mentions
-- Select best fit or flag for manual assignment
+Score users by:
+- Skill match: 40%
+- Workload availability: 35%
+- Role fit: 15%
+- Past performance: 10%
 
-## Decision Rules:
-[Include full decision matrix]
+If user mentioned in text, prioritize them (confidence 0.9).
 
-## Output Requirements:
-- Always return structured JSON matching the schema
-- Be deterministic - same input should produce same output
-- When uncertain (confidence < 0.7), set requires_review = true
-- Provide clear reasoning for all decisions
+### Step 7: Developer Alternatives
+If sender is INDIVIDUAL_CONTRIBUTOR and doesn't meet task threshold:
+- Check if adding context → UPDATE_DESCRIPTION
+- Check if opinion/discussion → ADD_COMMENT
+- Check if breaking down work → CREATE_SUBTASK
+- Otherwise → IGNORE
 
-## Priority Hierarchy:
-Trello tasks (source_id: trello) have highest authority.
-When conflicts arise, higher priority source wins.
+## OUTPUT REQUIREMENTS
+
+Always return valid JSON matching the DecisionOutput schema:
+- Be deterministic (same input = same output)
+- Provide confidence scores for all decisions
+- Set requires_review = true when confidence < 0.7
+- Include clear reasoning for decisions
+- List all actions to take
+
+## PRIORITY RULES
+
+1. Trello source always has highest authority
+2. Higher role = higher task probability
+3. When in doubt, flag for human review
+4. Never create duplicate tasks
 ```
+
+---
+
+### 9.6 Conversation Flow Examples
+
+#### Example 1: Executive Creates Task
+
+**Message 1 - Your System to OpenAI:**
+```json
+{
+  "role": "user",
+  "content": {
+    "source_id": "teams",
+    "source_priority": 5,
+    "task_content": {
+      "raw_text": "We need to improve our checkout conversion rate. Look into what's causing drop-offs.",
+      "metadata": {}
+    },
+    "sender": {
+      "user_id": "user-123",
+      "name": "Sarah Chen",
+      "role": "VP of Product",
+      "title": "VP of Product"
+    },
+    "context": {
+      "timestamp": "2024-01-15T10:30:00Z",
+      "channel_type": "executive"
+    }
+  }
+}
+```
+
+**Message 2 - OpenAI Response (Tool Calls):**
+```json
+{
+  "role": "assistant",
+  "tool_calls": [
+    {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+        "name": "get_existing_tasks",
+        "arguments": "{\"keywords\": [\"checkout\", \"conversion\", \"drop-off\"], \"status_filter\": [\"TODO\", \"IN_PROGRESS\"]}"
+      }
+    },
+    {
+      "id": "call_2",
+      "type": "function",
+      "function": {
+        "name": "get_users_by_source",
+        "arguments": "{\"source_id\": \"teams\", \"include_workload\": true}"
+      }
+    }
+  ]
+}
+```
+
+**Message 3 - Your System (Tool Results):**
+```json
+{
+  "role": "tool",
+  "tool_call_id": "call_1",
+  "content": "{\"tasks\": [], \"total_count\": 0}"
+}
+```
+```json
+{
+  "role": "tool",
+  "tool_call_id": "call_2",
+  "content": "{\"users\": [{\"id\": \"u1\", \"name\": \"Alex Dev\", \"role_category\": \"INDIVIDUAL_CONTRIBUTOR\", \"skills\": [\"frontend\", \"analytics\"], \"workload\": {\"capacity_percentage\": 60}}]}"
+}
+```
+
+**Message 4 - OpenAI Final Response:**
+```json
+{
+  "classification": {
+    "type": "VALID_TASK",
+    "task_probability": 0.65,
+    "adjusted_probability": 0.975,
+    "action_taken": "PROCEED_TO_ALGORITHM",
+    "reasoning": "VP of Product requesting investigation. Role multiplier 1.5x applied. Executive threshold 0.4 exceeded."
+  },
+  "role_analysis": {
+    "role_category": "EXECUTIVE",
+    "role_title": "VP of Product",
+    "confidence": 1.0,
+    "inference_method": "explicit",
+    "multiplier_applied": 1.5,
+    "threshold_used": 0.4
+  },
+  "decision": {
+    "action": "CREATE_NEW_TASK",
+    "confidence": 0.95,
+    "reasoning": "No related tasks found. Executive directive to investigate checkout issues."
+  },
+  "task": {
+    "title": "Investigate checkout conversion drop-offs",
+    "description": "Analyze checkout funnel to identify causes of conversion drop-offs and recommend improvements.",
+    "timing": {
+      "due_date": null,
+      "estimated_minutes": 480,
+      "complexity": "HIGH"
+    },
+    "assignment": {
+      "assignee_id": "u1",
+      "assignee_name": "Alex Dev",
+      "assignment_confidence": 0.75,
+      "assignment_reasoning": "Has frontend and analytics skills, 60% capacity available"
+    },
+    "classification": {
+      "priority": "HIGH",
+      "type": "SPIKE",
+      "labels": ["checkout", "conversion", "analytics"]
+    }
+  },
+  "actions": [
+    {
+      "type": "CREATE",
+      "payload": { ... }
+    },
+    {
+      "type": "NOTIFY",
+      "target_id": "u1",
+      "payload": {
+        "message": "You've been assigned: Investigate checkout conversion drop-offs",
+        "type": "ASSIGNMENT"
+      }
+    }
+  ]
+}
+```
+
+---
+
+#### Example 2: Developer Discussion (Ignored)
+
+**Input:**
+```json
+{
+  "source_id": "teams",
+  "task_content": {
+    "raw_text": "I was thinking the auth module might need some refactoring"
+  },
+  "sender": {
+    "role_category": "INDIVIDUAL_CONTRIBUTOR",
+    "title": "Software Engineer"
+  }
+}
+```
+
+**Output (No Tool Calls Needed):**
+```json
+{
+  "classification": {
+    "type": "DEVELOPER_DISCUSSION",
+    "task_probability": 0.4,
+    "adjusted_probability": 0.28,
+    "action_taken": "IGNORE",
+    "reasoning": "Tentative language ('was thinking', 'might'). Developer threshold 0.8 not met. No clear actionable item."
+  },
+  "decision": {
+    "action": "IGNORED",
+    "confidence": 0.85,
+    "reasoning": "Developer conversation without clear task intent"
+  },
+  "actions": []
+}
+```
+
+---
+
+#### Example 3: Developer Adding Context to Existing Task
+
+**Input:**
+```json
+{
+  "source_id": "teams",
+  "task_content": {
+    "raw_text": "For the login task, we also need to handle the case where session expires during checkout"
+  },
+  "sender": {
+    "role_category": "INDIVIDUAL_CONTRIBUTOR"
+  },
+  "context": {
+    "thread_id": "thread-456"
+  }
+}
+```
+
+**After get_existing_tasks returns a matching "Login feature" task:**
+
+**Output:**
+```json
+{
+  "classification": {
+    "type": "VALID_TASK",
+    "task_probability": 0.5,
+    "adjusted_probability": 0.35,
+    "action_taken": "ALT_ACTION",
+    "reasoning": "References existing task. Contains additional requirement."
+  },
+  "decision": {
+    "action": "UPDATE_DESCRIPTION",
+    "confidence": 0.8,
+    "reasoning": "Developer adding edge case to existing login task"
+  },
+  "actions": [
+    {
+      "type": "UPDATE_DESCRIPTION",
+      "target_task_id": "task-789",
+      "content_to_append": "\n\n**Additional Requirement:**\nHandle session expiry during checkout flow.",
+      "source_message": {
+        "sender_id": "dev-123",
+        "timestamp": "2024-01-15T14:00:00Z"
+      }
+    }
+  ]
+}
+```
+
+---
+
+### 9.7 Response Schema (Structured Output)
+
+Use OpenAI's structured output feature to guarantee valid responses:
+
+```json
+{
+  "name": "TaskDecisionOutput",
+  "strict": true,
+  "schema": {
+    "type": "object",
+    "required": ["classification", "decision", "actions"],
+    "additionalProperties": false,
+    "properties": {
+      "classification": {
+        "type": "object",
+        "required": ["type", "task_probability", "action_taken", "reasoning"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["VALID_TASK", "QUESTION_ONLY", "CONVERSATION", "ACKNOWLEDGMENT", "INCOMPLETE", "SPAM", "DEVELOPER_DISCUSSION"]
+          },
+          "task_probability": {"type": "number", "minimum": 0, "maximum": 1},
+          "adjusted_probability": {"type": "number", "minimum": 0, "maximum": 1},
+          "action_taken": {
+            "type": "string",
+            "enum": ["PROCEED_TO_ALGORITHM", "IGNORE", "REQUEST_CLARIFICATION", "FLAG_FOR_REVIEW", "ALT_ACTION"]
+          },
+          "reasoning": {"type": "string"}
+        }
+      },
+      "role_analysis": {
+        "type": "object",
+        "properties": {
+          "role_category": {
+            "type": "string",
+            "enum": ["EXECUTIVE", "MANAGEMENT", "LEAD", "INDIVIDUAL_CONTRIBUTOR", "UNKNOWN"]
+          },
+          "role_title": {"type": ["string", "null"]},
+          "confidence": {"type": "number"},
+          "inference_method": {
+            "type": "string",
+            "enum": ["explicit", "parsed", "inferred"]
+          },
+          "multiplier_applied": {"type": "number"},
+          "threshold_used": {"type": "number"}
+        }
+      },
+      "decision": {
+        "type": "object",
+        "required": ["action", "confidence", "reasoning"],
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["CREATE_NEW_TASK", "CREATE_AS_SUBTASK", "CREATE_AS_PARENT_AND_RETIRE", "REPLACE_EXISTING", "SKIP_OR_MERGE", "IGNORED", "NEEDS_CLARIFICATION", "UPDATE_DESCRIPTION", "ADD_COMMENT", "CREATE_SUBTASK"]
+          },
+          "confidence": {"type": "number"},
+          "reasoning": {"type": "string"}
+        }
+      },
+      "task": {
+        "type": ["object", "null"],
+        "properties": {
+          "title": {"type": "string"},
+          "description": {"type": "string"},
+          "timing": {
+            "type": "object",
+            "properties": {
+              "due_date": {"type": ["string", "null"]},
+              "due_date_source": {"type": "string"},
+              "estimated_minutes": {"type": "integer"},
+              "complexity": {"type": "string"}
+            }
+          },
+          "assignment": {
+            "type": "object",
+            "properties": {
+              "assignee_id": {"type": ["string", "null"]},
+              "assignee_name": {"type": ["string", "null"]},
+              "assignment_confidence": {"type": "number"},
+              "assignment_reasoning": {"type": "string"}
+            }
+          },
+          "classification": {
+            "type": "object",
+            "properties": {
+              "priority": {"type": "string"},
+              "type": {"type": "string"},
+              "labels": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        }
+      },
+      "relationships": {
+        "type": "object",
+        "properties": {
+          "parent_id": {"type": ["string", "null"]},
+          "is_parent_of": {"type": "array", "items": {"type": "string"}},
+          "migrated_subtasks": {"type": "array", "items": {"type": "string"}},
+          "conflicts_with": {"type": "array", "items": {"type": "string"}}
+        }
+      },
+      "flags": {
+        "type": "object",
+        "properties": {
+          "requires_review": {"type": "boolean"},
+          "review_reasons": {"type": "array", "items": {"type": "string"}},
+          "due_date_adjusted": {"type": "boolean"},
+          "assignment_uncertain": {"type": "boolean"}
+        }
+      },
+      "actions": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["CREATE", "UPDATE", "UPDATE_DESCRIPTION", "ADD_COMMENT", "ARCHIVE", "LINK", "UNLINK", "ASSIGN", "NOTIFY", "IGNORE"]
+            },
+            "target_task_id": {"type": "string"},
+            "payload": {"type": "object"}
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+---
+
+### 9.8 Implementation Checklist
+
+Your system needs to implement:
+
+| Component | Description | Notes |
+|-----------|-------------|-------|
+| **OpenAI Client** | Wrapper to call OpenAI API | Handle retries, rate limits |
+| **Function Handlers** | Endpoints for each function | Return data in expected format |
+| **Message Builder** | Construct messages with input | Follow input schema |
+| **Response Parser** | Parse structured output | Validate against schema |
+| **Action Executor** | Execute actions array | Route to appropriate services |
+| **Audit Logger** | Log full request/response | For debugging and learning |
+
+---
+
+### 9.9 Cost Optimization Tips
+
+| Strategy | Implementation |
+|----------|----------------|
+| **Cache decisions** | Hash input, cache output for identical messages |
+| **Skip obvious non-tasks** | Pre-filter emojis, "thanks", etc. before calling OpenAI |
+| **Batch similar requests** | Group messages from same thread |
+| **Use smaller model for classification** | GPT-3.5 for step 0, GPT-4 for full analysis |
+| **Limit function results** | Return max 20 tasks, 50 users |
 
 ---
 
