@@ -2448,9 +2448,765 @@ Your system needs to implement:
 
 ---
 
-## 10. Edge Cases & Handling
+## 10. Output Protocol - Task Management System Integration
 
-### 10.1 Classification Edge Cases
+This section defines how AI decisions are translated into actions for task management systems. The protocol is designed to be **extensible** - while ClickUp is the primary target, the abstraction layer allows integration with other systems (Jira, Asana, Monday.com, etc.) in the future.
+
+### 10.1 Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    AI DECISION OUTPUT                           │
+│           (System-Agnostic Action Protocol)                     │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                 ACTION TRANSLATOR LAYER                         │
+│        Maps generic actions to system-specific API calls        │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+          ┌───────────────────┼───────────────────┐
+          ▼                   ▼                   ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│    ClickUp      │  │      Jira       │  │     Asana       │
+│    Adapter      │  │    Adapter      │  │    Adapter      │
+│                 │  │   (Future)      │  │   (Future)      │
+└─────────────────┘  └─────────────────┘  └─────────────────┘
+          │                   │                   │
+          ▼                   ▼                   ▼
+     ClickUp API         Jira API            Asana API
+```
+
+### 10.2 ClickUp Capabilities Reference
+
+Based on ClickUp API v2, these are all available capabilities that the AI can leverage:
+
+#### 10.2.1 Task Operations
+
+| Operation | API Endpoint | Description |
+|-----------|--------------|-------------|
+| **Create Task** | `POST /list/{list_id}/task` | Create new task with all properties |
+| **Update Task** | `PUT /task/{task_id}` | Modify task properties |
+| **Delete Task** | `DELETE /task/{task_id}` | Remove task permanently |
+| **Get Task** | `GET /task/{task_id}` | Retrieve task details |
+| **Get Tasks** | `GET /list/{list_id}/task` | List tasks (max 100/page) |
+
+#### 10.2.2 Task Properties
+
+| Property | Type | Notes |
+|----------|------|-------|
+| `name` | string | Task title (required) |
+| `description` | string | Plain text description |
+| `markdown_description` | string | Markdown formatted description |
+| `assignees` | array[user_id] | Multiple assignees supported |
+| `status` | string | Must match list's configured statuses |
+| `priority` | integer | 1=Urgent, 2=High, 3=Normal, 4=Low |
+| `due_date` | timestamp | Unix timestamp in milliseconds |
+| `due_date_time` | boolean | Include time component |
+| `start_date` | timestamp | Task start date |
+| `start_date_time` | boolean | Include time component |
+| `time_estimate` | integer | Milliseconds |
+| `tags` | array[string] | Tag names |
+| `parent` | task_id | Create as subtask of this task |
+| `links_to` | task_id | Task dependency |
+| `notify_all` | boolean | Notify watchers on creation |
+| `custom_fields` | array | Custom field values |
+
+#### 10.2.3 Subtask & Relationship Operations
+
+| Operation | API Endpoint | Description |
+|-----------|--------------|-------------|
+| **Create Subtask** | `POST /list/{list_id}/task` with `parent` | Create task as child of another |
+| **Add Task Link** | `POST /task/{task_id}/link/{links_to_task_id}` | Create relationship between tasks |
+| **Delete Task Link** | `DELETE /task/{task_id}/link/{links_to_task_id}` | Remove relationship |
+| **Add Dependency** | `POST /task/{task_id}/dependency` | Create blocking/waiting dependency |
+| **Delete Dependency** | `DELETE /task/{task_id}/dependency` | Remove dependency |
+| **Get Subtasks** | `GET /task/{task_id}?include_subtasks=true` | Retrieve subtasks |
+
+#### 10.2.4 Dependency Types (ClickUp)
+
+| Type | Meaning | Use Case |
+|------|---------|----------|
+| **waiting_on** | This task waits for another | Task B cannot start until Task A completes |
+| **blocking** | This task blocks another | Task A prevents Task B from starting |
+| **linked** | Plain relationship (no dependency) | Related tasks for reference |
+
+#### 10.2.5 Comment Operations
+
+| Operation | API Endpoint | Description |
+|-----------|--------------|-------------|
+| **Create Comment** | `POST /task/{task_id}/comment` | Add comment to task |
+| **Get Comments** | `GET /task/{task_id}/comment` | List task comments |
+| **Update Comment** | `PUT /comment/{comment_id}` | Edit existing comment |
+| **Delete Comment** | `DELETE /comment/{comment_id}` | Remove comment |
+
+#### 10.2.6 Checklist Operations
+
+| Operation | API Endpoint | Description |
+|-----------|--------------|-------------|
+| **Create Checklist** | `POST /task/{task_id}/checklist` | Add checklist to task |
+| **Edit Checklist** | `PUT /checklist/{checklist_id}` | Rename checklist |
+| **Delete Checklist** | `DELETE /checklist/{checklist_id}` | Remove checklist |
+| **Create Checklist Item** | `POST /checklist/{checklist_id}/checklist_item` | Add item |
+| **Update Checklist Item** | `PUT /checklist/{checklist_id}/checklist_item/{item_id}` | Edit/complete item |
+| **Delete Checklist Item** | `DELETE /checklist/{checklist_id}/checklist_item/{item_id}` | Remove item |
+
+#### 10.2.7 Time Tracking Operations
+
+| Operation | API Endpoint | Description |
+|-----------|--------------|-------------|
+| **Create Time Entry** | `POST /team/{team_id}/time_entries` | Log time to task |
+| **Get Time Entries** | `GET /team/{team_id}/time_entries` | List time entries |
+| **Update Time Entry** | `PUT /team/{team_id}/time_entries/{timer_id}` | Modify entry |
+| **Delete Time Entry** | `DELETE /team/{team_id}/time_entries/{timer_id}` | Remove entry |
+| **Start Timer** | `POST /team/{team_id}/time_entries/start` | Begin tracking |
+| **Stop Timer** | `POST /team/{team_id}/time_entries/stop` | End tracking |
+
+#### 10.2.8 Additional Operations
+
+| Operation | API Endpoint | Description |
+|-----------|--------------|-------------|
+| **Add Tag** | `POST /task/{task_id}/tag/{tag_name}` | Tag a task |
+| **Remove Tag** | `DELETE /task/{task_id}/tag/{tag_name}` | Untag a task |
+| **Set Custom Field** | `POST /task/{task_id}/field/{field_id}` | Update custom field value |
+| **Add Follower** | `POST /task/{task_id}/follower` | Add watcher to task |
+| **Remove Follower** | `DELETE /task/{task_id}/follower/{follower_id}` | Remove watcher |
+| **Upload Attachment** | `POST /task/{task_id}/attachment` | Attach file to task |
+
+---
+
+### 10.3 AI Decision to ClickUp Action Mapping
+
+This maps every possible AI decision to specific ClickUp API calls:
+
+#### 10.3.1 Task Creation Actions
+
+| AI Decision | ClickUp Actions | Notes |
+|-------------|-----------------|-------|
+| `CREATE_NEW_TASK` | `POST /list/{list_id}/task` | Full task creation |
+| `CREATE_AS_SUBTASK` | `POST /list/{list_id}/task` with `parent` | Set parent task ID |
+| `CREATE_AS_PARENT_AND_RETIRE` | 1. Create new task<br>2. Update old task status to "Archived"<br>3. Move subtasks to new parent | Multi-step operation |
+| `CREATE_SUBTASK` | `POST /list/{list_id}/task` with `parent` | From developer alternative action |
+
+#### 10.3.2 Task Update Actions
+
+| AI Decision | ClickUp Actions | Notes |
+|-------------|-----------------|-------|
+| `UPDATE_DESCRIPTION` | `PUT /task/{task_id}` with `markdown_description` | Append or replace |
+| `REPLACE_EXISTING` | `PUT /task/{task_id}` | Full update |
+| `UPDATE_STATUS` | `PUT /task/{task_id}` with `status` | Status change only |
+| `UPDATE_PRIORITY` | `PUT /task/{task_id}` with `priority` | Priority change only |
+| `UPDATE_DUE_DATE` | `PUT /task/{task_id}` with `due_date` | Date change only |
+| `UPDATE_ASSIGNEE` | `PUT /task/{task_id}` with `assignees` | Reassignment |
+
+#### 10.3.3 Relationship Actions
+
+| AI Decision | ClickUp Actions | Notes |
+|-------------|-----------------|-------|
+| `ADD_DEPENDENCY_BLOCKING` | `POST /task/{task_id}/dependency` with `depends_on` and `dependency_of` | Task blocks another |
+| `ADD_DEPENDENCY_WAITING` | `POST /task/{task_id}/dependency` with `depends_on` | Task waits on another |
+| `ADD_LINK` | `POST /task/{task_id}/link/{links_to_task_id}` | Non-blocking relationship |
+| `REMOVE_DEPENDENCY` | `DELETE /task/{task_id}/dependency?depends_on={id}` | Remove dependency |
+| `REMOVE_LINK` | `DELETE /task/{task_id}/link/{link_id}` | Remove relationship |
+| `MIGRATE_SUBTASKS` | For each subtask: `PUT /task/{subtask_id}` with new `parent` | Batch operation |
+
+#### 10.3.4 Comment & Collaboration Actions
+
+| AI Decision | ClickUp Actions | Notes |
+|-------------|-----------------|-------|
+| `ADD_COMMENT` | `POST /task/{task_id}/comment` | Add discussion/note |
+| `ADD_THREADED_COMMENT` | `POST /task/{task_id}/comment` with `parent` comment_id | Reply to comment |
+| `ASSIGN_USER` | `PUT /task/{task_id}` with updated `assignees` | Add/change assignee |
+| `ADD_FOLLOWER` | `POST /task/{task_id}/follower` | Add watcher |
+| `NOTIFY_USER` | Comment with `@mention` or `notify_all: true` | Alert specific users |
+
+#### 10.3.5 Checklist Actions
+
+| AI Decision | ClickUp Actions | Notes |
+|-------------|-----------------|-------|
+| `CREATE_CHECKLIST` | `POST /task/{task_id}/checklist` | New checklist |
+| `ADD_CHECKLIST_ITEM` | `POST /checklist/{id}/checklist_item` | Add item to checklist |
+| `COMPLETE_CHECKLIST_ITEM` | `PUT /checklist/{id}/checklist_item/{item_id}` with `resolved: true` | Mark done |
+| `CONVERT_TO_SUBTASK` | 1. Create subtask from checklist item<br>2. Delete checklist item | Promotion |
+
+#### 10.3.6 Time & Estimation Actions
+
+| AI Decision | ClickUp Actions | Notes |
+|-------------|-----------------|-------|
+| `SET_TIME_ESTIMATE` | `PUT /task/{task_id}` with `time_estimate` | In milliseconds |
+| `LOG_TIME` | `POST /team/{team_id}/time_entries` | Record actual time |
+| `START_TIMER` | `POST /team/{team_id}/time_entries/start` | Begin tracking |
+| `STOP_TIMER` | `POST /team/{team_id}/time_entries/stop` | End tracking |
+
+#### 10.3.7 Archive & Delete Actions
+
+| AI Decision | ClickUp Actions | Notes |
+|-------------|-----------------|-------|
+| `ARCHIVE_TASK` | `PUT /task/{task_id}` with status="archived" | Soft delete |
+| `DELETE_TASK` | `DELETE /task/{task_id}` | Hard delete (use carefully) |
+| `SKIP_OR_MERGE` | No action or `PUT /task/{task_id}` to merge | Duplicate handling |
+| `IGNORED` | No API call | Decision logged only |
+
+---
+
+### 10.4 Subtask Relationships - "Belongs To" Feature
+
+ClickUp supports rich subtask relationships. AI decisions must account for:
+
+#### 10.4.1 Subtask Properties
+
+```json
+{
+  "subtask_relationship": {
+    "parent_id": "string - parent task ID (REQUIRED for subtasks)",
+    "belongs_to": {
+      "task_id": "string - the parent this subtask belongs to",
+      "relationship_type": "SUBTASK | CHILD | COMPONENT",
+      "inherited_properties": {
+        "inherit_assignee": "boolean",
+        "inherit_due_date": "boolean",
+        "inherit_priority": "boolean",
+        "inherit_tags": "boolean",
+        "inherit_watchers": "boolean"
+      }
+    },
+    "sibling_order": "integer - position among siblings",
+    "can_have_subtasks": "boolean - ClickUp: subtasks cannot have subtasks"
+  }
+}
+```
+
+#### 10.4.2 Subtask Creation Rules
+
+```
+SUBTASK CREATION RULES:
+
+1. PARENT VALIDATION:
+   - Parent task MUST exist in the same list
+   - Parent CANNOT be a subtask itself (ClickUp limitation)
+   - Parent MUST NOT be archived/deleted
+
+2. PROPERTY INHERITANCE:
+   - Due date: Inherit if subtask due_date > parent due_date (auto-adjust)
+   - Assignee: Inherit unless explicitly different skill required
+   - Priority: Inherit unless subtask is more urgent
+   - Tags: Inherit project/feature tags, not status tags
+
+3. BELONGS_TO RELATIONSHIP:
+   - Always set parent_id in ClickUp API
+   - Track relationship in our system for migrations
+   - Support future "linked subtask" patterns (cross-list)
+
+4. CONSTRAINTS:
+   - Subtask due_date <= Parent due_date (warn if violated)
+   - Sum of subtask estimates should ≈ parent estimate
+   - Subtasks should complete before parent
+```
+
+#### 10.4.3 Subtask Belongs To Output Schema
+
+```json
+{
+  "action": "CREATE_AS_SUBTASK",
+  "task": {
+    "title": "Implement retry logic",
+    "description": "...",
+    "belongs_to": {
+      "parent_task_id": "abc123",
+      "parent_task_title": "Payment webhook reliability",
+      "relationship": "SUBTASK",
+      "inheritance": {
+        "due_date": true,
+        "assignee": true,
+        "priority": false,
+        "tags": ["payment", "backend"]
+      }
+    }
+  },
+  "clickup_payload": {
+    "name": "Implement retry logic",
+    "markdown_description": "...",
+    "parent": "abc123",
+    "assignees": [123],
+    "priority": 2,
+    "due_date": 1705680000000,
+    "tags": ["payment", "backend"]
+  }
+}
+```
+
+#### 10.4.4 Subtask Migration (Parent Retirement)
+
+When a task is retired and replaced by a broader parent:
+
+```json
+{
+  "action": "CREATE_AS_PARENT_AND_RETIRE",
+  "new_parent": {
+    "title": "Complete payment system overhaul",
+    "description": "Comprehensive update including webhook reliability, retry logic, and error handling"
+  },
+  "retired_task": {
+    "task_id": "old123",
+    "new_status": "archived",
+    "archive_reason": "Superseded by broader task"
+  },
+  "subtask_migration": {
+    "migrate_to_new_parent": true,
+    "subtasks_to_migrate": [
+      {
+        "subtask_id": "sub1",
+        "current_parent": "old123",
+        "new_parent": "new456",
+        "preserve_status": true
+      },
+      {
+        "subtask_id": "sub2",
+        "current_parent": "old123",
+        "new_parent": "new456",
+        "preserve_status": true
+      }
+    ]
+  },
+  "clickup_operations": [
+    {"method": "POST", "endpoint": "/list/{list_id}/task", "payload": "..."},
+    {"method": "PUT", "endpoint": "/task/sub1", "payload": {"parent": "new456"}},
+    {"method": "PUT", "endpoint": "/task/sub2", "payload": {"parent": "new456"}},
+    {"method": "PUT", "endpoint": "/task/old123", "payload": {"status": "archived"}}
+  ]
+}
+```
+
+---
+
+### 10.5 Complete Output Schema (System-Agnostic)
+
+The AI outputs a **system-agnostic** action protocol that the adapter layer translates:
+
+```json
+{
+  "decision_id": "uuid",
+  "timestamp": "ISO 8601",
+  "algorithm_version": "3.0",
+
+  "classification": { ... },
+  "role_analysis": { ... },
+  "conversation_context": { ... },
+  "decision": { ... },
+
+  "task": {
+    "id": "generated UUID (internal)",
+    "external_id": "null (set after creation in target system)",
+    "title": "string",
+    "description": "string (markdown supported)",
+    "status": "TODO | IN_PROGRESS | BLOCKED | IN_REVIEW | DONE | ARCHIVED",
+
+    "timing": {
+      "due_date": "ISO 8601 | null",
+      "start_date": "ISO 8601 | null",
+      "time_estimate_minutes": "integer | null",
+      "time_estimate_ms": "integer | null (for ClickUp)"
+    },
+
+    "assignment": {
+      "assignee_ids": ["array of user IDs"],
+      "reporter_id": "string | null",
+      "watcher_ids": ["array of user IDs"]
+    },
+
+    "classification": {
+      "priority": "URGENT | HIGH | NORMAL | LOW",
+      "priority_value": "1 | 2 | 3 | 4 (for ClickUp)",
+      "type": "FEATURE | BUG | TASK | EPIC | STORY | SPIKE",
+      "tags": ["array of tag names"]
+    },
+
+    "relationships": {
+      "belongs_to": {
+        "parent_task_id": "string | null",
+        "relationship_type": "SUBTASK | LINKED"
+      },
+      "dependencies": {
+        "blocking": ["task IDs this task blocks"],
+        "waiting_on": ["task IDs this task waits for"],
+        "linked_to": ["related task IDs (no dependency)"]
+      },
+      "subtasks_to_create": [
+        {
+          "title": "string",
+          "description": "string",
+          "inherit_from_parent": true
+        }
+      ]
+    },
+
+    "checklist": {
+      "name": "string | null",
+      "items": [
+        {"text": "string", "assignee_id": "string | null"}
+      ]
+    },
+
+    "custom_fields": {
+      "field_id": "value"
+    }
+  },
+
+  "actions": [
+    {
+      "sequence": 1,
+      "type": "CREATE_TASK | UPDATE_TASK | ADD_COMMENT | ADD_DEPENDENCY | ...",
+      "target": {
+        "type": "task | comment | checklist | time_entry",
+        "id": "string | null (null for creation)"
+      },
+      "payload": { },
+      "depends_on_action": "null | action sequence number",
+      "on_failure": "ABORT | CONTINUE | RETRY"
+    }
+  ],
+
+  "system_specific": {
+    "clickup": {
+      "list_id": "string (required)",
+      "space_id": "string",
+      "folder_id": "string | null"
+    },
+    "jira": {
+      "project_key": "string",
+      "issue_type": "string"
+    }
+  },
+
+  "audit": {
+    "source_message_id": "string",
+    "sender_id": "string",
+    "confidence": 0.0-1.0,
+    "requires_review": "boolean",
+    "review_reasons": ["array of strings"]
+  }
+}
+```
+
+---
+
+### 10.6 ClickUp Adapter Implementation
+
+The adapter translates the generic output to ClickUp API calls:
+
+#### 10.6.1 Priority Mapping
+
+| AI Priority | ClickUp Priority | Value |
+|-------------|------------------|-------|
+| `URGENT` | Urgent | 1 |
+| `HIGH` | High | 2 |
+| `NORMAL` | Normal | 3 |
+| `LOW` | Low | 4 |
+
+#### 10.6.2 Status Mapping
+
+AI status must map to ClickUp list-specific statuses. Each list may have different status names:
+
+```json
+{
+  "status_mapping": {
+    "default": {
+      "TODO": "to do",
+      "IN_PROGRESS": "in progress",
+      "BLOCKED": "blocked",
+      "IN_REVIEW": "review",
+      "DONE": "complete",
+      "ARCHIVED": "archived"
+    },
+    "list_123": {
+      "TODO": "backlog",
+      "IN_PROGRESS": "doing",
+      "DONE": "done"
+    }
+  }
+}
+```
+
+#### 10.6.3 Time Conversion
+
+```
+AI Output (minutes) → ClickUp API (milliseconds)
+
+time_estimate_ms = time_estimate_minutes * 60 * 1000
+
+Example: 120 minutes → 7,200,000 ms
+```
+
+#### 10.6.4 ClickUp Payload Generator
+
+```
+GENERATE_CLICKUP_PAYLOAD(ai_output):
+
+1. Base task payload:
+   {
+     "name": ai_output.task.title,
+     "markdown_description": ai_output.task.description,
+     "assignees": ai_output.task.assignment.assignee_ids,
+     "priority": ai_output.task.classification.priority_value,
+     "due_date": to_unix_ms(ai_output.task.timing.due_date),
+     "due_date_time": true,
+     "time_estimate": ai_output.task.timing.time_estimate_ms,
+     "tags": ai_output.task.classification.tags,
+     "notify_all": true
+   }
+
+2. IF subtask (belongs_to.parent_task_id exists):
+   payload.parent = ai_output.task.relationships.belongs_to.parent_task_id
+
+3. IF dependencies exist:
+   - Queue separate API calls for each dependency
+
+4. IF custom_fields:
+   - Queue separate API calls for each custom field
+
+RETURN {
+  endpoint: "/list/{list_id}/task",
+  method: "POST",
+  payload: payload,
+  follow_up_calls: [dependency_calls, custom_field_calls]
+}
+```
+
+---
+
+### 10.7 Future System Extensibility
+
+The output protocol supports future task management systems:
+
+#### 10.7.1 Adapter Interface
+
+```
+interface TaskManagementAdapter {
+  // System identification
+  getSystemId(): string
+  getApiVersion(): string
+
+  // Task operations
+  createTask(genericPayload): SystemSpecificPayload
+  updateTask(taskId, genericPayload): SystemSpecificPayload
+  deleteTask(taskId): void
+
+  // Relationship operations
+  createSubtask(parentId, genericPayload): SystemSpecificPayload
+  addDependency(taskId, dependsOnId, type): void
+  addLink(taskId, linkedTaskId): void
+
+  // Comment operations
+  addComment(taskId, content): void
+
+  // Mapping functions
+  mapPriority(genericPriority): SystemPriority
+  mapStatus(genericStatus, listContext): SystemStatus
+  mapTimeEstimate(minutes): SystemTimeFormat
+}
+```
+
+#### 10.7.2 System Capability Matrix
+
+| Capability | ClickUp | Jira | Asana | Monday |
+|------------|---------|------|-------|--------|
+| Subtasks | ✅ (1 level) | ✅ (multi) | ✅ (multi) | ✅ (subitems) |
+| Dependencies (blocking) | ✅ | ✅ | ✅ (Premium) | ✅ |
+| Dependencies (waiting) | ✅ | ✅ | ✅ (Premium) | ✅ |
+| Plain task links | ✅ | ✅ | ✅ | ❌ |
+| Multiple assignees | ✅ | ❌ (1) | ✅ | ✅ |
+| Time tracking | ✅ | ✅ (plugin) | ✅ (Premium) | ✅ |
+| Custom fields | ✅ | ✅ | ✅ | ✅ |
+| Checklists | ✅ | ❌ | ✅ | ✅ |
+| Watchers/Followers | ✅ | ✅ | ✅ | ✅ |
+| Markdown description | ✅ | ✅ (limited) | ✅ | ❌ |
+| Priority levels | 4 | 5 | 4 (custom) | 5 |
+
+#### 10.7.3 Capability Degradation
+
+When a target system lacks a capability:
+
+```
+HANDLE_MISSING_CAPABILITY(action, target_system):
+
+CASE action.type == "ADD_DEPENDENCY" AND !target_system.has_dependencies:
+  → Convert to comment: "⚠️ This task depends on: {linked_task_title}"
+  → Add as plain link if supported
+
+CASE action.type == "CREATE_SUBTASK" AND !target_system.has_subtasks:
+  → Create as regular task
+  → Add link to parent
+  → Prefix title with "[Subtask of: {parent_title}]"
+
+CASE action.type == "ADD_CHECKLIST" AND !target_system.has_checklists:
+  → Convert to markdown list in description
+
+CASE action.type == "MULTIPLE_ASSIGNEES" AND !target_system.allows_multiple:
+  → Assign to first assignee
+  → Add others as watchers
+  → Add comment noting additional assignees
+```
+
+---
+
+### 10.8 ClickUp API Integration Examples
+
+#### 10.8.1 Create Task with Subtask
+
+**AI Output:**
+```json
+{
+  "decision": {"action": "CREATE_NEW_TASK"},
+  "task": {
+    "title": "Implement payment webhook retry",
+    "description": "Add retry logic for failed webhooks",
+    "relationships": {
+      "subtasks_to_create": [
+        {"title": "Add exponential backoff", "inherit_from_parent": true},
+        {"title": "Add dead letter queue", "inherit_from_parent": true}
+      ]
+    }
+  }
+}
+```
+
+**ClickUp API Calls:**
+```
+1. POST /list/123/task
+   Body: {
+     "name": "Implement payment webhook retry",
+     "markdown_description": "Add retry logic for failed webhooks",
+     "priority": 2,
+     "assignees": [456]
+   }
+   Response: {"id": "task_789", ...}
+
+2. POST /list/123/task
+   Body: {
+     "name": "Add exponential backoff",
+     "parent": "task_789",
+     "priority": 2,
+     "assignees": [456]
+   }
+
+3. POST /list/123/task
+   Body: {
+     "name": "Add dead letter queue",
+     "parent": "task_789",
+     "priority": 2,
+     "assignees": [456]
+   }
+```
+
+#### 10.8.2 Add Blocking Dependency
+
+**AI Output:**
+```json
+{
+  "decision": {"action": "ADD_DEPENDENCY_BLOCKING"},
+  "task": {
+    "external_id": "task_abc",
+    "relationships": {
+      "dependencies": {
+        "blocking": ["task_xyz"]
+      }
+    }
+  }
+}
+```
+
+**ClickUp API Call:**
+```
+POST /task/task_abc/dependency
+Body: {
+  "depends_on": "task_xyz",
+  "dependency_of": "task_abc"
+}
+```
+
+#### 10.8.3 Update Description with Comment Attribution
+
+**AI Output:**
+```json
+{
+  "decision": {"action": "UPDATE_DESCRIPTION"},
+  "actions": [{
+    "type": "UPDATE_TASK",
+    "target": {"id": "task_123"},
+    "payload": {
+      "append_to_description": "\n\n---\n**Added by Alex Dev (Jan 15):**\nAlso need to handle session expiry edge case."
+    }
+  }]
+}
+```
+
+**ClickUp API Call:**
+```
+GET /task/task_123
+Response: {"markdown_description": "Original description..."}
+
+PUT /task/task_123
+Body: {
+  "markdown_description": "Original description...\n\n---\n**Added by Alex Dev (Jan 15):**\nAlso need to handle session expiry edge case."
+}
+```
+
+---
+
+### 10.9 Error Handling & Rollback
+
+#### 10.9.1 API Error Handling
+
+| Error Type | HTTP Code | Handling Strategy |
+|------------|-----------|-------------------|
+| Rate Limited | 429 | Exponential backoff, retry up to 3 times |
+| Not Found | 404 | Log error, skip action, continue with next |
+| Unauthorized | 401 | Refresh token, retry once |
+| Validation Error | 400 | Log payload, flag for manual review |
+| Server Error | 500 | Retry up to 2 times, then queue for later |
+| Timeout | - | Retry once with longer timeout |
+
+#### 10.9.2 Multi-Step Rollback
+
+For operations like CREATE_AS_PARENT_AND_RETIRE:
+
+```
+EXECUTE_WITH_ROLLBACK(operations):
+
+completed = []
+TRY:
+  FOR operation IN operations:
+    result = execute(operation)
+    completed.append({operation, result})
+
+CATCH error:
+  LOG "Operation failed: {error}"
+
+  # Rollback in reverse order
+  FOR {op, result} IN reversed(completed):
+    IF op.type == "CREATE_TASK":
+      DELETE /task/{result.id}
+    ELIF op.type == "UPDATE_TASK":
+      PUT /task/{op.target.id} with original values
+    ELIF op.type == "ADD_DEPENDENCY":
+      DELETE dependency
+
+  RETURN {
+    status: "FAILED",
+    error: error,
+    rolled_back: true,
+    requires_manual_intervention: false
+  }
+
+RETURN {status: "SUCCESS", results: completed}
+```
+
+---
+
+## 11. Edge Cases & Handling
+
+### 11.1 Classification Edge Cases
 
 | Edge Case | Handling Strategy |
 |-----------|-------------------|
@@ -2463,7 +3219,7 @@ Your system needs to implement:
 | URL only | Check URL type - Trello link = task reference, else IGNORE |
 | Forwarded message | Analyze forwarded content, not "FW:" prefix |
 
-### 10.2 Role-Based Edge Cases
+### 11.2 Role-Based Edge Cases
 
 | Edge Case | Handling Strategy |
 |-----------|-------------------|
@@ -2478,7 +3234,7 @@ Your system needs to implement:
 | New employee (no history) | Default based on title, lower confidence |
 | Conflicting role signals | Explicit role > parsed title > inferred |
 
-### 10.3 Conversation Context Edge Cases (Teams)
+### 11.3 Conversation Context Edge Cases (Teams)
 
 | Edge Case | Handling Strategy |
 |-----------|-------------------|
@@ -2495,7 +3251,7 @@ Your system needs to implement:
 | Mixed formal/casual thread | Focus on formal/business messages for task extraction |
 | Thread with no clear conclusion | Current message may be the conclusion; analyze for finality |
 
-### 10.4 Developer Alternative Action Edge Cases
+### 11.4 Developer Alternative Action Edge Cases
 
 | Edge Case | Handling Strategy |
 |-----------|-------------------|
@@ -2506,7 +3262,7 @@ Your system needs to implement:
 | Thread has multiple topics | Split into separate evaluations |
 | Reply to archived task | Reopen task or create new linked task |
 
-### 10.4 Algorithm Edge Cases
+### 11.5 Algorithm Edge Cases
 
 | Edge Case | Handling Strategy |
 |-----------|-------------------|
@@ -2523,15 +3279,16 @@ Your system needs to implement:
 
 ---
 
-## 11. Algorithm Versioning
+## 12. Algorithm Versioning
 
 Maintain version in output for traceability:
 - **v1.0**: Initial decision matrix with 3-factor weighting
 - **v2.0**: Added time estimation, due date analysis, user assignment
+- **v3.0**: Added ClickUp integration, output protocol, subtask relationships
 
 ---
 
-## 12. Next Steps
+## 13. Next Steps
 
 - [ ] Review and refine decision matrix thresholds
 - [ ] Define exact database schema for tasks
