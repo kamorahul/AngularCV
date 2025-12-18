@@ -140,8 +140,9 @@ Input → OpenAI analyzes → Calls functions (tasks, users) → Makes decisions
   "context": {
     "timestamp": "ISO 8601",
     "project_id": "string (optional)",
-    "channel_id": "string (optional) - for Teams",
+    "channel_id": "string (REQUIRED for Teams) - channel or chat ID",
     "channel_type": "executive | management | development | general (optional)",
+    "message_id": "string (REQUIRED for Teams) - unique message identifier",
     "thread_id": "string (optional) - if part of a thread",
     "reply_to_task_id": "string (optional) - if replying to task notification"
   }
@@ -696,6 +697,24 @@ Result: ADD_COMMENT to caching task
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
+│         STEP 1.5: CONVERSATION CONTEXT (MANDATORY FOR TEAMS)    │
+│                                                                 │
+│         IF source_id == "teams" (or any chat source):           │
+│         ┌────────────────────────────┐                          │
+│         │  get_conversation_context  │  ← MANDATORY             │
+│         │  (channel_id, message_id)  │                          │
+│         └────────────────────────────┘                          │
+│         Returns: recent messages, thread context, participants  │
+│                                                                 │
+│         AI uses context to:                                     │
+│         - Understand full conversation flow                     │
+│         - Extract additional details from prior messages        │
+│         - Determine if continuation vs new topic                │
+│         - Re-evaluate classification with full context          │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
 │              STEP 2: PARALLEL FUNCTION CALLS                    │
 │    ┌──────────────────────┐    ┌──────────────────────┐        │
 │    │  get_existing_tasks  │    │  get_users_by_source │        │
@@ -1169,6 +1188,17 @@ SPECIAL ASSIGNMENT RULES:
     "threshold_used": 0.4-0.8
   },
 
+  "conversation_context": {
+    "was_fetched": "boolean - true if get_conversation_context was called",
+    "source_type": "teams | slack | other_chat | none",
+    "messages_analyzed": "integer - number of prior messages analyzed",
+    "context_summary": "string - brief summary of conversation thread",
+    "additional_details_extracted": ["array of details found in prior messages"],
+    "highest_role_in_thread": "EXECUTIVE | MANAGEMENT | LEAD | INDIVIDUAL_CONTRIBUTOR",
+    "thread_topic": "string - inferred topic of the conversation",
+    "reclassified_after_context": "boolean - did classification change after seeing context"
+  },
+
   "decision": {
     "action": "CREATE_NEW_TASK | CREATE_AS_SUBTASK | CREATE_AS_PARENT_AND_RETIRE | REPLACE_EXISTING | SKIP_OR_MERGE | IGNORED | NEEDS_CLARIFICATION | UPDATE_DESCRIPTION | ADD_COMMENT",
     "confidence": 0.0-1.0,
@@ -1566,7 +1596,139 @@ OpenAI acts as the **decision-making brain** of the system. It is responsible fo
 
 ---
 
-#### 9.4.4 get_similar_completed_tasks
+#### 9.4.4 get_conversation_context (MANDATORY for Teams)
+
+**Purpose**: Fetch recent conversation history from chat systems to understand full context of a message.
+
+**When AI Calls This**: **ALWAYS** when `source_id = "teams"` (or any chat-based source). This is MANDATORY because a single message often lacks full context.
+
+**Why This Is Required**:
+- Chat messages are often fragmented across multiple messages
+- Previous messages may contain critical details (deadlines, requirements, assignees)
+- Thread context helps determine if message is a new task or continuation
+- Prevents misclassification due to missing context
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "get_conversation_context",
+    "description": "Fetch recent messages from the conversation/channel where this message originated. MANDATORY for Teams and chat-based sources. Use this to understand the full context of the incoming message.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "description": "The source system (teams, slack, etc.)"
+        },
+        "channel_id": {
+          "type": "string",
+          "description": "The channel or chat ID where the message was sent"
+        },
+        "thread_id": {
+          "type": "string",
+          "description": "Optional thread ID if message is part of a thread reply"
+        },
+        "message_id": {
+          "type": "string",
+          "description": "The current message ID to fetch context around"
+        },
+        "messages_before": {
+          "type": "integer",
+          "description": "Number of messages to fetch before current message. Default: 10"
+        },
+        "messages_after": {
+          "type": "integer",
+          "description": "Number of messages to fetch after current message. Default: 0"
+        },
+        "time_window_minutes": {
+          "type": "integer",
+          "description": "Alternative: fetch messages within this time window. Default: 60"
+        },
+        "include_reactions": {
+          "type": "boolean",
+          "description": "Include message reactions (for sentiment). Default: false"
+        }
+      },
+      "required": ["source_id", "channel_id"]
+    }
+  }
+}
+```
+
+**Your System Implementation** (Using Microsoft Graph API):
+```
+For Teams Channels:
+GET /teams/{team-id}/channels/{channel-id}/messages
+  ?$top={messages_before}
+  &$filter=lastModifiedDateTime gt {timestamp - time_window}
+
+For Teams Chats:
+GET /chats/{chat-id}/messages
+  ?$top={messages_before}
+
+For Thread Replies:
+GET /teams/{team-id}/channels/{channel-id}/messages/{message-id}/replies
+```
+
+**Your System Returns**:
+```json
+{
+  "conversation": {
+    "channel_id": "string",
+    "channel_name": "string",
+    "channel_type": "channel | group_chat | direct_message",
+    "team_name": "string | null"
+  },
+  "messages": [
+    {
+      "id": "string",
+      "content": "string",
+      "sender": {
+        "id": "string",
+        "name": "string",
+        "role_category": "EXECUTIVE | MANAGEMENT | LEAD | INDIVIDUAL_CONTRIBUTOR"
+      },
+      "timestamp": "ISO 8601",
+      "is_current_message": "boolean",
+      "reply_to_id": "string | null",
+      "mentions": ["array of user names mentioned"],
+      "attachments": [
+        {
+          "type": "file | link | task_reference",
+          "name": "string",
+          "url": "string | null"
+        }
+      ]
+    }
+  ],
+  "thread_context": {
+    "is_thread": "boolean",
+    "thread_starter_message": "string | null",
+    "total_replies": "integer"
+  },
+  "participants": [
+    {
+      "id": "string",
+      "name": "string",
+      "role_category": "string",
+      "message_count": "integer"
+    }
+  ]
+}
+```
+
+**How AI Uses This Context**:
+1. Reconstruct the full conversation flow
+2. Identify if current message is a follow-up to an earlier task mention
+3. Extract additional details mentioned in previous messages
+4. Determine the overall conversation topic/intent
+5. Identify the highest-role participant for priority weighting
+6. Check if task was already acknowledged or being worked on
+
+---
+
+#### 9.4.5 get_similar_completed_tasks
 
 **Purpose**: Get historical data for time estimation.
 
@@ -1638,10 +1800,11 @@ You are the Task Decision Engine for a project management system. Your job is to
 ## YOUR CAPABILITIES
 
 You have access to these functions:
-1. `get_existing_tasks` - Search for related tasks in the system
-2. `get_users_by_source` - Get available team members for assignment
-3. `get_task_subtasks` - Get subtasks of a specific task (for migration)
-4. `get_similar_completed_tasks` - Get historical data for time estimation
+1. `get_conversation_context` - **MANDATORY for Teams/chat sources** - Fetch recent conversation history
+2. `get_existing_tasks` - Search for related tasks in the system
+3. `get_users_by_source` - Get available team members for assignment
+4. `get_task_subtasks` - Get subtasks of a specific task (for migration)
+5. `get_similar_completed_tasks` - Get historical data for time estimation
 
 ## INPUT FORMAT
 
@@ -1675,6 +1838,14 @@ Apply sender role multiplier:
 - MANAGEMENT (PM, Product Manager): 1.3x multiplier, threshold 0.5
 - LEAD (Tech Lead, Senior): 1.1x multiplier, threshold 0.7
 - INDIVIDUAL_CONTRIBUTOR (Developer): 0.7x multiplier, threshold 0.8
+
+### Step 1.5: Conversation Context (MANDATORY for Teams)
+**CRITICAL**: If source_id is "teams" or any chat-based source:
+- You MUST call `get_conversation_context` FIRST before any other analysis
+- Use the conversation history to understand the full context
+- Re-evaluate classification based on the complete conversation
+- Extract any additional task details mentioned in prior messages
+- A single message may lack critical context - always fetch history for chat sources
 
 ### Step 2: Fetch Context
 If classified as VALID_TASK, call these in parallel:
@@ -1877,7 +2048,160 @@ Always return valid JSON matching the DecisionOutput schema:
 
 ---
 
-#### Example 2: Developer Discussion (Ignored)
+#### Example 2: Teams Message with Conversation Context (Mandatory)
+
+**Message 1 - Your System to OpenAI:**
+```json
+{
+  "role": "user",
+  "content": {
+    "source_id": "teams",
+    "source_priority": 5,
+    "task_content": {
+      "raw_text": "Yes, let's do that by Friday"
+    },
+    "sender": {
+      "user_id": "user-456",
+      "name": "Mike Johnson",
+      "role_category": "MANAGEMENT",
+      "title": "Project Manager"
+    },
+    "context": {
+      "timestamp": "2024-01-15T11:00:00Z",
+      "channel_id": "channel-abc",
+      "message_id": "msg-789",
+      "thread_id": "thread-456"
+    }
+  }
+}
+```
+
+**Message 2 - OpenAI MUST First Call get_conversation_context:**
+```json
+{
+  "role": "assistant",
+  "tool_calls": [
+    {
+      "id": "call_ctx",
+      "type": "function",
+      "function": {
+        "name": "get_conversation_context",
+        "arguments": "{\"source_id\": \"teams\", \"channel_id\": \"channel-abc\", \"thread_id\": \"thread-456\", \"message_id\": \"msg-789\", \"messages_before\": 10}"
+      }
+    }
+  ]
+}
+```
+
+**Message 3 - Your System Returns Context:**
+```json
+{
+  "role": "tool",
+  "tool_call_id": "call_ctx",
+  "content": {
+    "conversation": {
+      "channel_id": "channel-abc",
+      "channel_name": "Project Alpha",
+      "channel_type": "channel"
+    },
+    "messages": [
+      {
+        "id": "msg-786",
+        "content": "The payment integration is still having issues with the webhook callbacks",
+        "sender": {"name": "Alex Dev", "role_category": "INDIVIDUAL_CONTRIBUTOR"},
+        "timestamp": "2024-01-15T10:45:00Z"
+      },
+      {
+        "id": "msg-787",
+        "content": "I think we need to add retry logic and better error handling for the webhook failures",
+        "sender": {"name": "Sarah Tech Lead", "role_category": "LEAD"},
+        "timestamp": "2024-01-15T10:50:00Z"
+      },
+      {
+        "id": "msg-788",
+        "content": "Agreed. Can someone create a task for this?",
+        "sender": {"name": "Mike Johnson", "role_category": "MANAGEMENT"},
+        "timestamp": "2024-01-15T10:55:00Z"
+      },
+      {
+        "id": "msg-789",
+        "content": "Yes, let's do that by Friday",
+        "sender": {"name": "Mike Johnson", "role_category": "MANAGEMENT"},
+        "timestamp": "2024-01-15T11:00:00Z",
+        "is_current_message": true
+      }
+    ],
+    "thread_context": {
+      "is_thread": true,
+      "total_replies": 4
+    }
+  }
+}
+```
+
+**Message 4 - Now OpenAI Has Full Context, Calls Remaining Functions:**
+```json
+{
+  "role": "assistant",
+  "tool_calls": [
+    {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+        "name": "get_existing_tasks",
+        "arguments": "{\"keywords\": [\"payment\", \"webhook\", \"retry\", \"error handling\"]}"
+      }
+    },
+    {
+      "id": "call_2",
+      "type": "function",
+      "function": {
+        "name": "get_users_by_source",
+        "arguments": "{\"source_id\": \"teams\"}"
+      }
+    }
+  ]
+}
+```
+
+**Final Output - OpenAI Creates Task with Full Context:**
+```json
+{
+  "classification": {
+    "type": "VALID_TASK",
+    "task_probability": 0.9,
+    "adjusted_probability": 0.95,
+    "action_taken": "PROCEED_TO_ALGORITHM",
+    "reasoning": "PM confirming task creation with deadline. Conversation context reveals payment webhook issues need retry logic."
+  },
+  "decision": {
+    "action": "CREATE_NEW_TASK",
+    "confidence": 0.95,
+    "reasoning": "Full conversation reveals request for webhook retry logic. PM confirmed with Friday deadline."
+  },
+  "task": {
+    "title": "Add retry logic and error handling for payment webhook callbacks",
+    "description": "The payment integration webhook callbacks are failing intermittently. Need to implement:\n- Retry logic for failed webhook calls\n- Better error handling and logging\n- Recovery mechanism for missed callbacks\n\nDiscussed in Teams thread by Alex Dev and Sarah Tech Lead.",
+    "timing": {
+      "due_date": "2024-01-19T17:00:00Z",
+      "due_date_source": "explicit",
+      "estimated_minutes": 360,
+      "complexity": "MEDIUM"
+    },
+    "classification": {
+      "priority": "HIGH",
+      "type": "BUG",
+      "labels": ["payment", "webhook", "reliability"]
+    }
+  }
+}
+```
+
+**Key Point**: Without conversation context, "Yes, let's do that by Friday" would have been classified as ACKNOWLEDGMENT and IGNORED. With context, the full task was extracted.
+
+---
+
+#### Example 3: Developer Discussion (Ignored)
 
 **Input:**
 ```json
@@ -2154,7 +2478,24 @@ Your system needs to implement:
 | New employee (no history) | Default based on title, lower confidence |
 | Conflicting role signals | Explicit role > parsed title > inferred |
 
-### 10.3 Developer Alternative Action Edge Cases
+### 10.3 Conversation Context Edge Cases (Teams)
+
+| Edge Case | Handling Strategy |
+|-----------|-------------------|
+| No conversation history available | Proceed with single message, lower confidence, flag for review |
+| Thread has 100+ messages | Limit to most recent 20, prioritize messages from high-role senders |
+| Multiple topics in thread | Identify topic clusters, focus on cluster containing current message |
+| Conversation spans multiple days | Include time gaps in analysis, treat as separate contexts |
+| Bot/system messages in thread | Filter out automated messages, focus on human content |
+| Deleted messages in history | Acknowledge gaps, note incomplete context in reasoning |
+| Private DM vs group chat | DMs: full context critical. Group: prioritize messages mentioning sender |
+| Cross-channel references | If message references another channel, note but don't fetch (out of scope) |
+| Attachments in prior messages | Note file names/types for context (e.g., "spec.docx attached earlier") |
+| Non-English conversation | Attempt translation of all messages for consistent analysis |
+| Mixed formal/casual thread | Focus on formal/business messages for task extraction |
+| Thread with no clear conclusion | Current message may be the conclusion; analyze for finality |
+
+### 10.4 Developer Alternative Action Edge Cases
 
 | Edge Case | Handling Strategy |
 |-----------|-------------------|
