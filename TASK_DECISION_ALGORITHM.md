@@ -129,11 +129,21 @@ Input → OpenAI analyzes → Calls functions (tasks, users) → Makes decisions
     "mentioned_dates": ["array of date strings mentioned (optional)"],
     "metadata": {}
   },
+  "sender": {
+    "user_id": "string - who sent this message",
+    "name": "string",
+    "email": "string (optional)",
+    "role": "string (optional) - if known from source system",
+    "title": "string (optional) - job title if available",
+    "department": "string (optional)"
+  },
   "context": {
     "timestamp": "ISO 8601",
-    "user_id": "string (optional) - who submitted this",
     "project_id": "string (optional)",
-    "channel_id": "string (optional) - for Teams"
+    "channel_id": "string (optional) - for Teams",
+    "channel_type": "executive | management | development | general (optional)",
+    "thread_id": "string (optional) - if part of a thread",
+    "reply_to_task_id": "string (optional) - if replying to task notification"
   }
 }
 ```
@@ -359,6 +369,300 @@ UNCERTAIN_HANDLING:
    - Return clarification request to source
    - Example: "Is this a task you'd like me to track? Please confirm or provide more details."
 ```
+
+### 4.7 Role-Based Priority Weighting
+
+The **role of the sender** significantly influences whether a message becomes a task. AI analyzes the sender's role and adjusts classification accordingly.
+
+#### 4.7.1 Role Analysis
+
+AI determines the sender's role by:
+1. Looking up user info from `get_users_by_source` response
+2. Analyzing email signature, title mentions
+3. Checking organizational hierarchy data if available
+4. Inferring from communication patterns
+
+```
+ANALYZE_SENDER_ROLE(sender_info, context):
+
+1. CHECK explicit role data:
+   - IF sender_info.role exists:
+     - RETURN sender_info.role
+
+2. CHECK title/signature:
+   - Parse for titles: "CEO", "CTO", "VP", "Director", "Manager", "Lead", "Engineer"
+   - Parse for indicators: "Founder", "Head of", "Senior", "Junior"
+
+3. INFER from context:
+   - Channel type (executive channel vs dev channel)
+   - Communication style (directive vs collaborative)
+   - Historical patterns
+
+4. RETURN:
+   {
+     "role_category": "EXECUTIVE | MANAGEMENT | LEAD | INDIVIDUAL_CONTRIBUTOR",
+     "role_title": "string - specific title if known",
+     "confidence": 0.0-1.0,
+     "inference_method": "explicit | parsed | inferred"
+   }
+```
+
+#### 4.7.2 Role Categories & Task Probability Multipliers
+
+| Role Category | Description | Task Probability Multiplier | Rationale |
+|---------------|-------------|----------------------------|-----------|
+| **EXECUTIVE** | C-level, VP, Directors, Stakeholders | **1.5x** | High authority, messages often directive |
+| **MANAGEMENT** | Project Managers, Product Managers, Team Leads | **1.3x** | Frequently creating/assigning tasks |
+| **LEAD** | Tech Leads, Senior Engineers, Architects | **1.1x** | May create tasks or discuss technically |
+| **INDIVIDUAL_CONTRIBUTOR** | Developers, Designers, QA | **0.7x** | Often discussing, not directing |
+
+#### 4.7.3 Role-Adjusted Classification Algorithm
+
+```
+CLASSIFY_WITH_ROLE(raw_input, source, sender_info):
+
+1. GET base classification:
+   base_result = CLASSIFY_INPUT(raw_input, source)
+
+2. ANALYZE sender role:
+   role_analysis = ANALYZE_SENDER_ROLE(sender_info, context)
+
+3. APPLY role multiplier:
+   role_multiplier = get_multiplier(role_analysis.role_category)
+   adjusted_probability = base_result.task_probability * role_multiplier
+   adjusted_probability = min(adjusted_probability, 1.0)  # Cap at 1.0
+
+4. RE-EVALUATE classification thresholds:
+
+   IF role_analysis.role_category == "EXECUTIVE":
+       # Executives: Lower threshold, almost always create task
+       task_threshold = 0.4  (instead of 0.7)
+       uncertain_threshold = 0.2  (instead of 0.4)
+
+   ELIF role_analysis.role_category == "MANAGEMENT":
+       # Managers: Slightly lower threshold
+       task_threshold = 0.5
+       uncertain_threshold = 0.3
+
+   ELIF role_analysis.role_category == "INDIVIDUAL_CONTRIBUTOR":
+       # Developers: Higher threshold required
+       task_threshold = 0.8
+       uncertain_threshold = 0.5
+
+   ELSE:
+       # Default thresholds
+       task_threshold = 0.7
+       uncertain_threshold = 0.4
+
+5. DETERMINE final classification with adjusted thresholds:
+
+   IF adjusted_probability >= task_threshold:
+       classification = VALID_TASK
+   ELIF adjusted_probability >= uncertain_threshold:
+       classification = UNCERTAIN
+   ELSE:
+       # For developers: check for alternative actions
+       IF role_analysis.role_category == "INDIVIDUAL_CONTRIBUTOR":
+           alt_action = CHECK_DEVELOPER_ALTERNATIVES(raw_input)
+           RETURN alt_action
+       ELSE:
+           # Standard non-task classification
+           classification = determine_non_task_type(raw_input)
+
+6. RETURN:
+   {
+     ...base_classification_fields,
+     "role_analysis": role_analysis,
+     "adjusted_probability": adjusted_probability,
+     "threshold_used": task_threshold
+   }
+```
+
+#### 4.7.4 Developer Conversation Handling
+
+When two developers are discussing (both sender and context indicate INDIVIDUAL_CONTRIBUTOR), apply special handling:
+
+```
+CHECK_DEVELOPER_ALTERNATIVES(raw_input, existing_tasks):
+
+# Developer messages that don't meet task threshold may still be actionable
+
+1. CHECK for task reference:
+   referenced_task = find_task_reference(raw_input, existing_tasks)
+
+   IF referenced_task exists:
+
+       # Check if it's additional context/description
+       IF contains_technical_details(raw_input) OR contains_requirements(raw_input):
+           RETURN {
+             "action": "UPDATE_DESCRIPTION",
+             "target_task_id": referenced_task.id,
+             "content_to_append": extract_relevant_content(raw_input),
+             "confidence": 0.7
+           }
+
+       # Check if it's a comment/discussion point
+       IF is_discussion_or_opinion(raw_input):
+           RETURN {
+             "action": "ADD_COMMENT",
+             "target_task_id": referenced_task.id,
+             "comment_content": raw_input,
+             "confidence": 0.8
+           }
+
+       # Check if it's breaking down work (subtask)
+       IF describes_subtask(raw_input):
+           RETURN {
+             "action": "CREATE_SUBTASK",
+             "parent_task_id": referenced_task.id,
+             "subtask_content": raw_input,
+             "confidence": 0.6
+           }
+
+2. CHECK for implicit task reference:
+   # Developer might be discussing a task without explicit reference
+   similar_tasks = find_similar_active_tasks(raw_input, existing_tasks)
+
+   IF similar_tasks.length == 1 AND similarity > 0.6:
+       # Likely discussing this task
+       RETURN check_action_type(raw_input, similar_tasks[0])
+
+   ELIF similar_tasks.length > 1:
+       # Ambiguous - could be related to multiple tasks
+       RETURN {
+         "action": "FLAG_FOR_REVIEW",
+         "possible_targets": similar_tasks,
+         "confidence": 0.4
+       }
+
+3. DEFAULT - not actionable:
+   RETURN {
+     "action": "IGNORE",
+     "classification": "DEVELOPER_DISCUSSION",
+     "reasoning": "Developer conversation without clear actionable outcome"
+   }
+```
+
+#### 4.7.5 Content Analysis for Developer Messages
+
+```
+CONTENT_ANALYSIS_HELPERS:
+
+contains_technical_details(text):
+  - Code snippets or file references
+  - Technical specifications
+  - Architecture decisions
+  - API contracts
+
+contains_requirements(text):
+  - "should", "must", "needs to"
+  - Acceptance criteria language
+  - User story patterns
+
+is_discussion_or_opinion(text):
+  - "I think", "maybe we should", "what if"
+  - Questions about approach
+  - Pros/cons discussion
+
+describes_subtask(text):
+  - Specific component of larger work
+  - "first we need to", "step 1"
+  - Granular technical work
+```
+
+#### 4.7.6 Role-Based Examples
+
+```
+EXAMPLE 1 - Executive Message:
+Input: "We should look into improving our checkout flow"
+Sender: CEO (EXECUTIVE)
+Source: teams
+Analysis:
+  - Base task_probability: 0.5 (vague, no clear action)
+  - Role multiplier: 1.5x
+  - Adjusted probability: 0.75
+  - Executive threshold: 0.4
+  - 0.75 >= 0.4 ✓
+Result: VALID_TASK → CREATE_NEW_TASK
+Priority: HIGH (executive initiated)
+
+EXAMPLE 2 - Project Manager Message:
+Input: "Can someone handle the payment gateway integration?"
+Sender: PM (MANAGEMENT)
+Source: teams
+Analysis:
+  - Base task_probability: 0.7 (action verb, clear deliverable)
+  - Role multiplier: 1.3x
+  - Adjusted probability: 0.91
+  - Management threshold: 0.5
+  - 0.91 >= 0.5 ✓
+Result: VALID_TASK → CREATE_NEW_TASK
+
+EXAMPLE 3 - Developer Discussion (Low Score):
+Input: "I was thinking the auth module might need some refactoring"
+Sender: Developer (INDIVIDUAL_CONTRIBUTOR)
+Source: teams (dev channel)
+Analysis:
+  - Base task_probability: 0.4 (tentative language)
+  - Role multiplier: 0.7x
+  - Adjusted probability: 0.28
+  - Developer threshold: 0.8
+  - 0.28 < 0.5 (uncertain threshold)
+  - Check developer alternatives...
+  - No clear task reference, discussion language
+Result: IGNORE (DEVELOPER_DISCUSSION)
+
+EXAMPLE 4 - Developer with Clear Task:
+Input: "We need to fix the null pointer exception in UserService.java line 45"
+Sender: Developer (INDIVIDUAL_CONTRIBUTOR)
+Source: teams
+Analysis:
+  - Base task_probability: 0.85 (clear action, specific)
+  - Role multiplier: 0.7x
+  - Adjusted probability: 0.595
+  - Developer threshold: 0.8
+  - 0.595 < 0.8, but check alternatives...
+  - Very specific technical issue → likely valid
+  - Override: Mark as task due to specificity
+Result: VALID_TASK (BUG type)
+
+EXAMPLE 5 - Developer Adding Context:
+Input: "For the login task, we also need to handle the case where session expires"
+Sender: Developer (INDIVIDUAL_CONTRIBUTOR)
+Source: teams
+Analysis:
+  - Base task_probability: 0.5
+  - Role multiplier: 0.7x
+  - Adjusted probability: 0.35
+  - Developer threshold: 0.8
+  - Check alternatives...
+  - References "login task" → find matching task
+  - Contains additional requirement
+Result: UPDATE_DESCRIPTION on referenced task
+OR: CREATE_SUBTASK for session handling
+
+EXAMPLE 6 - Developer Comment:
+Input: "I think we should use Redis for caching here instead of in-memory"
+Sender: Developer (INDIVIDUAL_CONTRIBUTOR)
+Source: teams (in thread about caching task)
+Analysis:
+  - Base task_probability: 0.3 (opinion, not directive)
+  - Role multiplier: 0.7x
+  - Adjusted probability: 0.21
+  - Context: Thread references caching task
+Result: ADD_COMMENT to caching task
+```
+
+#### 4.7.7 Role-Based Decision Matrix Summary
+
+| Sender Role | Task Score ≥ 0.8 | Task Score 0.5-0.8 | Task Score 0.3-0.5 | Task Score < 0.3 |
+|-------------|------------------|--------------------|--------------------|------------------|
+| **Executive** | CREATE_TASK (HIGH priority) | CREATE_TASK | CREATE_TASK or FLAG_REVIEW | FLAG_REVIEW |
+| **Management** | CREATE_TASK | CREATE_TASK | FLAG_REVIEW | IGNORE |
+| **Lead** | CREATE_TASK | CREATE_TASK or FLAG | FLAG_REVIEW or ALT_ACTION | ALT_ACTION or IGNORE |
+| **Developer** | CREATE_TASK | CHECK_ALT_ACTIONS | CHECK_ALT_ACTIONS | IGNORE or COMMENT |
+
+**ALT_ACTIONS** = UPDATE_DESCRIPTION, ADD_COMMENT, CREATE_SUBTASK
 
 ---
 
@@ -849,14 +1153,24 @@ SPECIAL ASSIGNMENT RULES:
 ```json
 {
   "classification": {
-    "type": "VALID_TASK | QUESTION_ONLY | CONVERSATION | ACKNOWLEDGMENT | INCOMPLETE | SPAM",
+    "type": "VALID_TASK | QUESTION_ONLY | CONVERSATION | ACKNOWLEDGMENT | INCOMPLETE | SPAM | DEVELOPER_DISCUSSION",
     "task_probability": 0.0-1.0,
-    "action_taken": "PROCEED_TO_ALGORITHM | IGNORE | REQUEST_CLARIFICATION | FLAG_FOR_REVIEW",
+    "adjusted_probability": 0.0-1.0,
+    "action_taken": "PROCEED_TO_ALGORITHM | IGNORE | REQUEST_CLARIFICATION | FLAG_FOR_REVIEW | ALT_ACTION",
     "reasoning": "string - why this classification"
   },
 
+  "role_analysis": {
+    "role_category": "EXECUTIVE | MANAGEMENT | LEAD | INDIVIDUAL_CONTRIBUTOR | UNKNOWN",
+    "role_title": "string | null",
+    "confidence": 0.0-1.0,
+    "inference_method": "explicit | parsed | inferred",
+    "multiplier_applied": 0.7-1.5,
+    "threshold_used": 0.4-0.8
+  },
+
   "decision": {
-    "action": "CREATE_NEW_TASK | CREATE_AS_SUBTASK | CREATE_AS_PARENT_AND_RETIRE | REPLACE_EXISTING | SKIP_OR_MERGE | IGNORED | NEEDS_CLARIFICATION",
+    "action": "CREATE_NEW_TASK | CREATE_AS_SUBTASK | CREATE_AS_PARENT_AND_RETIRE | REPLACE_EXISTING | SKIP_OR_MERGE | IGNORED | NEEDS_CLARIFICATION | UPDATE_DESCRIPTION | ADD_COMMENT",
     "confidence": 0.0-1.0,
     "reasoning": "string - explanation of decision"
   },
@@ -940,11 +1254,55 @@ SPECIAL ASSIGNMENT RULES:
 |-------------|-------------|------------------|
 | `CREATE` | Create new task | full task object |
 | `UPDATE` | Update existing task | task_id, fields to update |
+| `UPDATE_DESCRIPTION` | Append to task description | task_id, content_to_append |
+| `ADD_COMMENT` | Add comment to task | task_id, comment_content, author_id |
 | `ARCHIVE` | Retire/archive task | task_id, reason |
 | `LINK` | Create parent-child relationship | parent_id, child_id |
 | `UNLINK` | Remove relationship | parent_id, child_id |
 | `ASSIGN` | Assign user to task | task_id, user_id |
 | `NOTIFY` | Send notification | user_ids, message, type |
+| `IGNORE` | No action taken | reasoning |
+
+### 8.3 Developer Alternative Action Payloads
+
+```json
+{
+  "action": "UPDATE_DESCRIPTION",
+  "target_task_id": "UUID of existing task",
+  "content_to_append": "string - the new content to add",
+  "append_location": "end | section",
+  "section_name": "string | null (if appending to specific section)",
+  "source_message": {
+    "sender_id": "string",
+    "timestamp": "ISO 8601",
+    "raw_content": "original message"
+  }
+}
+
+{
+  "action": "ADD_COMMENT",
+  "target_task_id": "UUID of existing task",
+  "comment": {
+    "content": "string",
+    "author_id": "string",
+    "author_name": "string",
+    "timestamp": "ISO 8601",
+    "type": "DISCUSSION | TECHNICAL | QUESTION | UPDATE"
+  }
+}
+
+{
+  "action": "CREATE_SUBTASK",
+  "parent_task_id": "UUID of parent task",
+  "subtask": {
+    "title": "string",
+    "description": "string",
+    "estimated_minutes": "integer | null",
+    "inherit_assignee": "boolean",
+    "inherit_due_date": "boolean"
+  }
+}
+```
 
 ---
 
@@ -1153,7 +1511,33 @@ When conflicts arise, higher priority source wins.
 | URL only | Check URL type - Trello link = task reference, else IGNORE |
 | Forwarded message | Analyze forwarded content, not "FW:" prefix |
 
-### 10.2 Algorithm Edge Cases
+### 10.2 Role-Based Edge Cases
+
+| Edge Case | Handling Strategy |
+|-----------|-------------------|
+| Unknown sender role | Default to LEAD (middle tier), flag for review |
+| External stakeholder | Treat as EXECUTIVE if from client/partner domain |
+| Bot/automated sender | IGNORE unless explicitly configured webhook |
+| Multiple senders (group message) | Use highest role among participants |
+| Sender role changed recently | Use current role, not historical |
+| Contractor/vendor | Treat as INDIVIDUAL_CONTRIBUTOR unless specified |
+| Executive in dev channel | Still apply EXECUTIVE multiplier |
+| Developer in executive channel | Apply INDIVIDUAL_CONTRIBUTOR but flag for review |
+| New employee (no history) | Default based on title, lower confidence |
+| Conflicting role signals | Explicit role > parsed title > inferred |
+
+### 10.3 Developer Alternative Action Edge Cases
+
+| Edge Case | Handling Strategy |
+|-----------|-------------------|
+| Comment references multiple tasks | Flag for review, list possible targets |
+| Description update too long | Suggest creating subtask instead |
+| Comment is actually a blocker | Detect blocker keywords, create BLOCKED status update |
+| Developer "assigns" to another | Detect assignment language, suggest ASSIGN action |
+| Thread has multiple topics | Split into separate evaluations |
+| Reply to archived task | Reopen task or create new linked task |
+
+### 10.4 Algorithm Edge Cases
 
 | Edge Case | Handling Strategy |
 |-----------|-------------------|
